@@ -67,12 +67,12 @@ multisbo [OPTIONS] <package_name>
 
 Install `letsencrypt` with all required (non‑optional) dependencies:
 ```bash
-./multisbo letsencrypt
+multisbo letsencrypt
 ```
 
 Install `letsencrypt` including optional dependencies, interactively:
 ```bash
-./multisbo --with-optional --interactive letsencrypt
+multisbo --with-optional --interactive letsencrypt
 ```
 
 ## Behaviour
