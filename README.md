@@ -31,12 +31,17 @@ A bash wrapper for `sbopkg` that recursively resolves and installs SlackBuild pa
      ```bash
      wget https://github.com/sbopkg/sbopkg/releases/download/0.38.3/sbopkg-0.38.3-noarch-1_wsr.tgz
      sudo installpkg sbopkg-0.38.3-noarch-1_wsr.tgz
-2. Save the script as `multisbo` (e.g., in `~/bin/` or `/usr/local/bin/`).
-3. Make it executable:
+     ```
+2. Save the script as `multisbo` (e.g., in `/usr/sbin/`, `~/bin/` or `/usr/local/bin/`).
+   ```bash
+   wget https://raw.githubusercontent.com/annemedia/mutlisbo/refs/heads/main/mutlisbo
+   sudo mv mutlisbo /usr/sbin/
+   ```
+4. Make it executable:
    ```bash
    chmod +x multisbo
    ```
-4. Ensure `sbopkg` is synced:
+5. Ensure `sbopkg` is synced:
    ```bash
    sudo sbopkg -r
    ```
