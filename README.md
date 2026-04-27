@@ -4,13 +4,12 @@ A bash wrapper for `sbopkg` that recursively resolves and installs SlackBuild pa
 
 ## Overview
 
-`multisbo` automates the installation of a target SlackBuild package and all its required dependencies as defined in the `.info` file’s `REQUIRES` field. It handles dependency trees, optional dependencies, and several edge cases that the standard `sbopkg` tool does not cover automatically.
+`multisbo` automates the installation of a target SlackBuild package and all its required dependencies as defined in the `.info` file’s `REQUIRES` field. It handles dependency trees and several edge cases that the standard `sbopkg` tool does not cover automatically.
 
 ## Features
 
 - Recursive dependency resolution with cycle detection.
 - Respects the `REQUIRES` field of each `.info` file.
-- Optional dependencies can be included with `--with-optional`.
 - Non‑interactive operation by default (using `sbopkg -B -k -e continue`); interactive mode available via `--interactive`.
 - Caches all `.info` file locations after the first run to speed up subsequent invocations.
 - Pre‑downloads all source tarballs (handles multi‑file `DOWNLOAD` entries).
@@ -59,20 +58,19 @@ multisbo [OPTIONS] <package_name>
 
 | Option | Description |
 |--------|-------------|
-| `--with-optional`   | Also install dependencies marked as optional in the `.info` file. |
 | `--interactive`     | Run `sbopkg` in interactive mode (without `-B -k -e continue`). |
 | `-h`, `--help`      | Display help and exit. |
 
 ### Examples
 
-Install `letsencrypt` with all required (non‑optional) dependencies:
+Install `letsencrypt` without confirmation:
 ```bash
 multisbo letsencrypt
 ```
 
-Install `letsencrypt` including optional dependencies, interactively:
+Install `letsencrypt`, interactively:
 ```bash
-multisbo --with-optional --interactive letsencrypt
+multisbo --interactive letsencrypt
 ```
 
 ## Behaviour
