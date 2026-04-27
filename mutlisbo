@@ -43,6 +43,10 @@ check_dependencies() {
 }
 
 check_sudo() {
+    if [[ $EUID -eq 0 ]]; then
+        # Already root, no need for sudo trickery
+        return 0
+    fi
     if ! sudo -v; then
         error "sudo failed – do you have proper sudo rights?"
         cleanup 1
