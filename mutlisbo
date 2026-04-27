@@ -1,0 +1,492 @@
+#!/bin/bash
+# multisbo - Recursive dependency installer for sbopkg with direct build fallback
+# Usage: ./multisbo [--with-optional] [--interactive] <package_name>
+
+set -o pipefail
+
+SCRIPT_NAME=$(basename "$0")
+LOG_FILE="/tmp/multisbo.log"
+WITH_OPTIONAL=0
+INTERACTIVE=0
+SBO_VERSION=""
+SUDO_PID=0
+
+
+if [ -t 1 ]; then
+    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; NC=''
+fi
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $*" >> "$LOG_FILE"
+}
+error() { echo -e "${RED}ERROR: $*${NC}" >&2; log "ERROR: $*"; }
+info()  { echo -e "${GREEN}$*${NC}"; log "INFO: $*"; }
+warn()  { echo -e "${YELLOW}$*${NC}"; log "WARN: $*"; }
+
+cleanup() {
+    [[ $SUDO_PID -ne 0 ]] && kill "$SUDO_PID" 2>/dev/null
+    exit "$1"
+}
+
+check_dependencies() {
+    local missing=0
+    for cmd in sbopkg grep sed tr find ls wget installpkg compgen; do
+        if ! command -v "$cmd" &>/dev/null; then
+            error "Required command '$cmd' not found."
+            missing=1
+        fi
+    done
+    if [[ $missing -eq 1 ]]; then
+        cleanup 1
+    fi
+}
+
+check_sudo() {
+    if ! sudo -v; then
+        error "sudo failed – do you have proper sudo rights?"
+        cleanup 1
+    fi
+    (
+        while true; do sudo -n true; sleep 50; done 2>/dev/null
+    ) &
+    SUDO_PID=$!
+}
+
+check_sbopkg_lock() {
+    local lockfiles=("/tmp/sbopkg.lock" "/var/lock/sbopkg.lock")
+    for lock in "${lockfiles[@]}"; do
+        if [[ -f "$lock" ]]; then
+            warn "Found $lock – another sbopkg process may be running."
+            read -p "Wait for it to finish? (y/N): " choice
+            if [[ "$choice" =~ ^[Yy]$ ]]; then
+                while [[ -f "$lock" ]]; do
+                    sleep 2
+                done
+                info "Lock released, continuing."
+            else
+                error "Please resolve the lock file manually."
+                cleanup 1
+            fi
+            break
+        fi
+    done
+}
+
+get_slackware_version() {
+    if [[ -f /etc/slackware-version ]]; then
+        local version=$(grep -oP 'Slackware \K[0-9.]+' /etc/slackware-version)
+        if [[ -n "$version" ]]; then
+            echo "$version"
+            return
+        fi
+    fi
+    warn "Could not determine Slackware version, defaulting to 15.0"
+    echo "15.0"
+}
+
+# Persistent cache
+declare -A INFO_CACHE
+CACHE_DIR="$HOME/.cache/multisbo"
+mkdir -p "$CACHE_DIR"
+
+load_persistent_cache() {
+    local sbo_dir="/var/lib/sbopkg/SBo/$SBO_VERSION"
+    if [[ ! -d "$sbo_dir" ]]; then
+        error "SBo repository not found at $sbo_dir"
+        error "Please run 'sudo sbopkg -s' to sync."
+        cleanup 1
+    fi
+
+    CACHE_FILE="$CACHE_DIR/${SBO_VERSION}.cache"
+    if [[ -f "$CACHE_FILE" ]]; then
+        local newest_sbo=$(find "$sbo_dir" -type f -name "*.info" -printf '%T@\n' 2>/dev/null | sort -nr | head -1)
+        local cache_mtime=$(stat -c %Y "$CACHE_FILE" 2>/dev/null)
+        if [[ -n "$newest_sbo" ]] && (( $(echo "$cache_mtime > $newest_sbo" | bc -l) )); then
+            source "$CACHE_FILE" 2>/dev/null
+            if declare -p INFO_CACHE &>/dev/null; then
+                info "Loaded persistent cache from $CACHE_FILE"
+                return 0
+            fi
+        fi
+    fi
+
+    build_full_cache
+}
+
+build_full_cache() {
+    local sbo_dir="/var/lib/sbopkg/SBo/$SBO_VERSION"
+    info "Building full .info file cache (this may take a few seconds)..."
+    INFO_CACHE=()
+    local count=0
+    while IFS= read -r -d '' info; do
+        local pkg_name=$(basename "$info" .info)
+        INFO_CACHE["$pkg_name"]="$info"
+        ((count++))
+    done < <(find "$sbo_dir" -type f -name "*.info" -print0 2>/dev/null)
+    info "Cached $count package info files."
+
+    {
+        echo "declare -A INFO_CACHE=("
+        for key in "${!INFO_CACHE[@]}"; do
+            printf "  [%q]=%q\n" "$key" "${INFO_CACHE[$key]}"
+        done
+        echo ")"
+    } > "$CACHE_FILE"
+    info "Cache written to $CACHE_FILE"
+}
+
+add_to_cache() {
+    local pkg="$1"
+    local sbo_dir="/var/lib/sbopkg/SBo/$SBO_VERSION"
+    local info_file=$(find "$sbo_dir" -maxdepth 3 -type f -name "${pkg}.info" -print -quit 2>/dev/null)
+    if [[ -n "$info_file" ]]; then
+        INFO_CACHE["$pkg"]="$info_file"
+        printf "INFO_CACHE[%q]=%q\n" "$pkg" "$info_file" >> "$CACHE_FILE"
+        return 0
+    else
+        return 1
+    fi
+}
+
+get_info_file() {
+    local pkg="$1"
+    if [[ -n "${INFO_CACHE[$pkg]}" ]]; then
+        echo "${INFO_CACHE[$pkg]}"
+    else
+        if add_to_cache "$pkg"; then
+            echo "${INFO_CACHE[$pkg]}"
+        else
+            echo ""
+        fi
+    fi
+}
+
+parse_requires() {
+    local info_file="$1"
+    local req_line=$(grep -E '^REQUIRES=' "$info_file" | head -1)
+    if [[ -z "$req_line" ]]; then
+        return
+    fi
+    req_line=$(echo "$req_line" | sed -E 's/^REQUIRES=//; s/^"//; s/"$//; s/^\x27//; s/\x27$//')
+    req_line=$(echo "$req_line" | tr ',' ' ')
+    local deps=()
+    for dep in $req_line; do
+        [[ -z "$dep" ]] && continue
+        if [[ "$WITH_OPTIONAL" -eq 0 ]]; then
+            if [[ "$dep" =~ (optional|\(optional\)|\[optional\]|:optional|OPTIONAL) ]]; then
+                warn "Skipping optional dependency '$dep' (use --with-optional to include)"
+                continue
+            fi
+        fi
+        deps+=("$dep")
+    done
+    echo "${deps[@]}"
+}
+
+check_installed() {
+    local pkg="$1"
+    compgen -G "/var/log/packages/${pkg}-*" >/dev/null && return 0
+    return 1
+}
+
+direct_build() {
+    local pkg="$1"
+    local info_file=$(get_info_file "$pkg")
+    local pkg_dir=$(dirname "$info_file")
+
+    source "$info_file" 2>/dev/null
+    if [[ -z "$PRGNAM" || -z "$VERSION" ]]; then
+        error "Could not source .info file for $pkg"
+        return 1
+    fi
+
+    info "Directly building $PRGNAM (version $VERSION) using SlackBuild..."
+
+    cd "$pkg_dir" || return 1
+
+    local all_urls=()
+    for var in DOWNLOAD DOWNLOAD_x86_64 DOWNLOAD_arm; do
+        val="${!var}"
+        if [[ -n "$val" ]]; then
+            for url in $val; do
+                all_urls+=("$url")
+            done
+        fi
+    done
+
+    local missing=0
+    for url in "${all_urls[@]}"; do
+        local filename=$(basename "$url" | sed 's/?.*//')
+        if [[ ! -f "$filename" ]]; then
+            if [[ -f "/var/cache/sbopkg/$filename" ]]; then
+                ln -sf "/var/cache/sbopkg/$filename" "$filename"
+                info "Symlinked $filename from cache"
+            else
+                error "Missing source file: $filename"
+                missing=1
+            fi
+        fi
+    done
+
+    if [[ $missing -eq 1 ]]; then
+        error "Source files missing – cannot build directly"
+        return 1
+    fi
+
+    if [ -f "./${PRGNAM}.SlackBuild" ]; then
+        info "Running ./${PRGNAM}.SlackBuild ..."
+        sudo bash "./${PRGNAM}.SlackBuild" 2>&1 | tee -a "$LOG_FILE"
+        if [ $? -ne 0 ]; then
+            error "SlackBuild failed for $PRGNAM"
+            return 1
+        fi
+    else
+        error "No SlackBuild script found in $pkg_dir"
+        return 1
+    fi
+
+    local built_pkg=$(ls -t /tmp/${PRGNAM}-${VERSION}-*.t?z 2>/dev/null | head -1)
+    if [[ -z "$built_pkg" ]]; then
+        built_pkg=$(ls -t /tmp/${PRGNAM}-*.t?z 2>/dev/null | head -1)
+    fi
+    if [[ -f "$built_pkg" ]]; then
+        info "Installing $built_pkg ..."
+        if sudo installpkg "$built_pkg" 2>&1 | tee -a "$LOG_FILE"; then
+            info "Direct installation succeeded for $PRGNAM"
+            PROCESSED["$PRGNAM"]=1
+            return 0
+        else
+            error "Direct installation command failed for $PRGNAM"
+            return 1
+        fi
+    else
+        error "No package file found in /tmp for $PRGNAM (looked for ${PRGNAM}-${VERSION}-*.t?z)"
+        return 1
+    fi
+}
+
+install_package() {
+    local pkg="$1"
+    local parent="$2"
+
+    if check_installed "$pkg"; then
+        info "$pkg already installed (skipping)."
+        return 0
+    fi
+
+    info "Installing $pkg (required by $parent)..."
+
+    local info_file=$(get_info_file "$pkg")
+    local urls=()
+    if [[ -f "$info_file" ]]; then
+        (
+            source "$info_file" 2>/dev/null
+            for var in $(set | grep -E '^DOWNLOAD[_a-zA-Z0-9]*=' | cut -d= -f1); do
+                val="${!var}"
+                for url in $val; do
+                    [[ -n "$url" ]] && echo "$url"
+                done
+            done
+        ) > /tmp/multisbo_urls.$$
+        if [[ -s /tmp/multisbo_urls.$$ ]]; then
+            mapfile -t urls < /tmp/multisbo_urls.$$
+            rm -f /tmp/multisbo_urls.$$
+            for url in "${urls[@]}"; do
+                local filename=$(basename "$url" | sed 's/?.*//')
+                if [[ ! -f "/var/cache/sbopkg/$filename" ]]; then
+                    info "Pre‑downloading missing source: $filename"
+                    sudo wget -q --show-progress -O "/var/cache/sbopkg/$filename" "$url" 2>&1 | tee -a "$LOG_FILE"
+                fi
+            done
+        fi
+    fi
+
+    local cmd="sudo sbopkg -B -k -e continue -i $pkg"
+    [[ $INTERACTIVE -eq 1 ]] && cmd="sudo sbopkg -i $pkg"
+
+    log "Running: $cmd"
+    local tmp_out=$(mktemp)
+    eval "$cmd" 2>&1 | tee -a "$LOG_FILE" | tee "$tmp_out"
+    local sbopkg_exit=${PIPESTATUS[0]}
+
+    if [[ $sbopkg_exit -eq 0 ]] || ( [[ $sbopkg_exit -eq 1 ]] && check_installed "$pkg" ); then
+        local waited=0
+        local max_wait=5
+        while [[ $waited -lt $max_wait ]]; do
+            if check_installed "$pkg"; then
+                info "$pkg installed successfully via sbopkg."
+                rm -f "$tmp_out"
+                return 0
+            fi
+            sleep 1
+            ((waited++))
+        done
+        warn "sbopkg reported success but $pkg not in /var/log/packages/ after ${max_wait}s – assuming installed."
+        rm -f "$tmp_out"
+        return 0
+    fi
+
+    if [[ $INTERACTIVE -eq 0 ]]; then
+        warn "sbopkg failed (exit $sbopkg_exit) – attempting direct build for $pkg..."
+        if direct_build "$pkg"; then
+            info "$pkg installed successfully via direct build."
+            rm -f "$tmp_out"
+            return 0
+        else
+            error "Direct build also failed for $pkg"
+        fi
+    fi
+
+    error "Failed to install $pkg (required by $parent)"
+    rm -f "$tmp_out"
+    read -p "Continue with remaining packages? (y/n): " choice
+    if [[ "$choice" != "y" && "$choice" != "Y" ]]; then
+        error "Aborted by user."
+        cleanup 1
+    fi
+    FAILED["$pkg"]="$parent"
+    return 1
+}
+
+# Recursive resolver
+declare -A PROCESSED
+declare -A FAILED
+declare -A VISITING
+
+resolve() {
+    local pkg="$1"
+    local parent="$2"
+    local depth="$3"
+
+    if [[ -n "${PROCESSED[$pkg]}" ]]; then
+        return
+    fi
+
+    if [[ -n "${VISITING[$pkg]}" ]]; then
+        error "Circular dependency detected: $pkg"
+        error "Dependency chain: $parent -> ... -> $pkg"
+        cleanup 1
+    fi
+    VISITING["$pkg"]=1
+
+    if check_installed "$pkg"; then
+        info "$pkg already installed."
+        PROCESSED["$pkg"]=1
+        unset VISITING["$pkg"]
+        return
+    fi
+
+    local info_file=$(get_info_file "$pkg")
+    if [[ -z "$info_file" ]]; then
+        error "Cannot find .info file for $pkg (required by $parent)"
+        read -p "Continue anyway? (y/n): " choice
+        if [[ "$choice" != "y" && "$choice" != "Y" ]]; then
+            cleanup 1
+        else
+            FAILED["$pkg"]="$parent"
+            PROCESSED["$pkg"]=1
+            unset VISITING["$pkg"]
+            return
+        fi
+    fi
+
+    local deps=($(parse_requires "$info_file"))
+    for dep in "${deps[@]}"; do
+        resolve "$dep" "$pkg" "$((depth+1))"
+    done
+
+    if ! check_installed "$pkg"; then
+        install_package "$pkg" "$parent"
+    fi
+    PROCESSED["$pkg"]=1
+    unset VISITING["$pkg"]
+}
+
+print_summary() {
+    echo ""
+    if [[ ${#FAILED[@]} -gt 0 ]]; then
+        error "=== Summary of failures ==="
+        for pkg in "${!FAILED[@]}"; do
+            local parent="${FAILED[$pkg]}"
+            echo "  $pkg (required by $parent)"
+        done
+        log "Failures: ${!FAILED[@]}"
+    else
+        info "All packages installed successfully."
+    fi
+    echo ""
+    info "Full log written to: $LOG_FILE"
+}
+
+usage() {
+    cat <<EOF
+Usage: $SCRIPT_NAME [OPTIONS] <package_name>
+
+Options:
+  --with-optional    Install optional dependencies as well (default: skip)
+  --interactive      Do NOT use sbopkg -B -k -e continue; let sbopkg ask prompts manually
+  -h, --help         Show this help
+
+Example:
+  $SCRIPT_NAME letsencrypt
+  $SCRIPT_NAME --with-optional --interactive python3-pytz
+EOF
+}
+
+main() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --with-optional) WITH_OPTIONAL=1; shift ;;
+            --interactive)   INTERACTIVE=1; shift ;;
+            -h|--help)       usage; exit 0 ;;
+            --)              shift; break ;;
+            -*)              error "Unknown option: $1"; usage; exit 1 ;;
+            *)               break ;;
+        esac
+    done
+
+    if [[ $# -ne 1 ]]; then
+        error "Missing package name."
+        usage
+        exit 1
+    fi
+    local target_pkg="$1"
+
+    check_dependencies
+    check_sudo
+    check_sbopkg_lock
+
+    SBO_VERSION=$(get_slackware_version)
+    info "Using SBo version: $SBO_VERSION"
+
+    if [[ $INTERACTIVE -eq 1 ]]; then
+        info "Running in INTERACTIVE mode (sbopkg will ask all prompts)"
+    else
+        info "Running in AUTO mode with pre‑download and direct build fallback"
+    fi
+
+    load_persistent_cache
+
+    if [[ -z "$(get_info_file "$target_pkg")" ]]; then
+        error "Package $target_pkg not found in SBo $SBO_VERSION"
+        cleanup 1
+    fi
+
+    echo "===== multisbo run started at $(date) =====" > "$LOG_FILE"
+    log "Target: $target_pkg, With optional: $WITH_OPTIONAL, Interactive: $INTERACTIVE, SBo version: $SBO_VERSION"
+
+    resolve "$target_pkg" "command line" 0
+
+    print_summary
+    if [[ ${#FAILED[@]} -gt 0 ]]; then
+        cleanup 1
+    else
+        cleanup 0
+    fi
+}
+
+trap 'cleanup 1' INT TERM
+
+main "$@"
