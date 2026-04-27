@@ -1,12 +1,11 @@
 #!/bin/bash
 # multisbo - Recursive dependency installer for sbopkg with direct build fallback
-# Usage: ./multisbo [--with-optional] [--interactive] <package_name>
+# Usage: ./multisbo [--interactive] <package_name>
 
 set -o pipefail
 
 SCRIPT_NAME=$(basename "$0")
 LOG_FILE="/tmp/multisbo.log"
-WITH_OPTIONAL=0
 INTERACTIVE=0
 SBO_VERSION=""
 SUDO_PID=0
@@ -174,12 +173,6 @@ parse_requires() {
     local deps=()
     for dep in $req_line; do
         [[ -z "$dep" ]] && continue
-        if [[ "$WITH_OPTIONAL" -eq 0 ]]; then
-            if [[ "$dep" =~ (optional|\(optional\)|\[optional\]|:optional|OPTIONAL) ]]; then
-                warn "Skipping optional dependency '$dep' (use --with-optional to include)"
-                continue
-            fi
-        fi
         deps+=("$dep")
     done
     echo "${deps[@]}"
@@ -425,20 +418,18 @@ usage() {
 Usage: $SCRIPT_NAME [OPTIONS] <package_name>
 
 Options:
-  --with-optional    Install optional dependencies as well (default: skip)
   --interactive      Do NOT use sbopkg -B -k -e continue; let sbopkg ask prompts manually
   -h, --help         Show this help
 
 Example:
   $SCRIPT_NAME letsencrypt
-  $SCRIPT_NAME --with-optional --interactive python3-pytz
+  $SCRIPT_NAME --interactive letsencrypt
 EOF
 }
 
 main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --with-optional) WITH_OPTIONAL=1; shift ;;
             --interactive)   INTERACTIVE=1; shift ;;
             -h|--help)       usage; exit 0 ;;
             --)              shift; break ;;
@@ -475,7 +466,7 @@ main() {
     fi
 
     echo "===== multisbo run started at $(date) =====" > "$LOG_FILE"
-    log "Target: $target_pkg, With optional: $WITH_OPTIONAL, Interactive: $INTERACTIVE, SBo version: $SBO_VERSION"
+    log "Target: $target_pkg, Interactive: $INTERACTIVE, SBo version: $SBO_VERSION"
 
     resolve "$target_pkg" "command line" 0
 
