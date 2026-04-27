@@ -97,7 +97,7 @@ load_persistent_cache() {
     local sbo_dir="/var/lib/sbopkg/SBo/$SBO_VERSION"
     if [[ ! -d "$sbo_dir" ]]; then
         error "SBo repository not found at $sbo_dir"
-        error "Please run 'sudo sbopkg -s' to sync."
+        error "Please run 'sudo sbopkg -r' to sync."
         cleanup 1
     fi
 
