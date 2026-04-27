@@ -13,7 +13,7 @@ A bash wrapper for `sbopkg` that recursively resolves and installs SlackBuild pa
 - Non‑interactive operation by default (using `sbopkg -B -k -e continue`); interactive mode available via `--interactive`.
 - Caches all `.info` file locations after the first run to speed up subsequent invocations.
 - Pre‑downloads all source tarballs (handles multi‑file `DOWNLOAD` entries).
-- Falls back to a direct `SlackBuild` + `installpkg` when `sbopkg` fails (e.g., due to broken downloads or MD5 order issues).
+- Falls back to a direct SlackBuild + installpkg when sbopkg fails – for example, when it mishandles redirected GitHub URLs, multi‑line DOWNLOAD entries, or MD5 checksum ordering.
 - Logs all actions to `/tmp/multisbo.log`.
 - Package detection: checks `/var/log/packages/` before attempting installation.
 
