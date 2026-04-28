@@ -33,7 +33,7 @@ A bash wrapper for `sbopkg` that recursively resolves and installs SlackBuild pa
      ```
 2. Download the script
    ```bash
-   wget https://raw.githubusercontent.com/annemedia/mutlisbo/refs/heads/main/mutlisbo
+   wget https://raw.githubusercontent.com/annemedia/multisbo/refs/heads/main/multisbo
    ```
 3. Make it executable:
    ```bash
@@ -41,7 +41,7 @@ A bash wrapper for `sbopkg` that recursively resolves and installs SlackBuild pa
    ```
 4. Move it to bin (e.g., `/usr/sbin/`, `~/bin/` or `/usr/local/bin/`).
    ```bash
-   sudo mv mutlisbo /usr/sbin/
+   sudo mv multisbo /usr/sbin/
    ``` 
 5. Ensure `sbopkg` is synced:
    ```bash
