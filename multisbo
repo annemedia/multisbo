@@ -1,14 +1,37 @@
 #!/bin/bash
-# multisbo - Recursive dependency installer for sbopkg with direct build fallback
-# Usage: ./multisbo [--interactive] <package_name>
+# multisbo - Standalone recursive dependency builder for SlackBuilds
+# Usage: ./multisbo [OPTIONS] <package_name>
 
 set -o pipefail
 
 SCRIPT_NAME=$(basename "$0")
 LOG_FILE="/tmp/multisbo.log"
-INTERACTIVE=0
+USE_NATIVE_FLAGS=1
+FORCE_SINGLE=0
+USE_CMAKE_FIX=0
+CMAKE_POLICY_VERSION="3.5"
 SBO_VERSION=""
 SUDO_PID=0
+CHECK_UPDATES=0
+UPDATE_MODE=0
+CONFIRMED_UPDATE=0
+SYNC_SBO=0
+SYNC_SBO_BRANCH=""
+SYNC_ALIEN=0
+REVERSE_DEPS=0
+ELF_CACHE_FILE=""
+REMOVE_MODE=0
+INTERACTIVE=0
+PREFER_ALIEN=0
+ALIEN_SYNC_OFFERED=0
+
+MULTISBO_HOME="${HOME}/.cache/multisbo"
+SBO_REPO_DIR="${MULTISBO_HOME}/SBo"
+ALIEN_DIR="${MULTISBO_HOME}/alien"
+SOURCE_CACHE_DIR="${MULTISBO_HOME}/sources"
+CACHE_DIR="${MULTISBO_HOME}/info_cache"
+ALIEN_INFO_DIR="${CACHE_DIR}/alien_info"
+mkdir -p "$CACHE_DIR" "$SOURCE_CACHE_DIR" "$ALIEN_INFO_DIR"
 
 
 if [ -t 1 ]; then
@@ -17,21 +40,64 @@ else
     RED=''; GREEN=''; YELLOW=''; NC=''
 fi
 
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $*" >> "$LOG_FILE"
-}
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $*" >> "$LOG_FILE"; }
 error() { echo -e "${RED}ERROR: $*${NC}" >&2; log "ERROR: $*"; }
 info()  { echo -e "${GREEN}$*${NC}"; log "INFO: $*"; }
 warn()  { echo -e "${YELLOW}$*${NC}"; log "WARN: $*"; }
+hr() { printf -- '%s\n' '======================================================================='; log '---'; }
+
+run_privileged() {
+    if [[ $EUID -eq 0 ]]; then
+        "$@"
+    elif command -v sudo &>/dev/null; then
+        sudo "$@"
+    else
+        error "This command requires root privileges and sudo is not installed."
+        error "Please run as root or install sudo."
+        return 1
+    fi
+}
 
 cleanup() {
     [[ $SUDO_PID -ne 0 ]] && kill "$SUDO_PID" 2>/dev/null
     exit "$1"
 }
 
+print_early_summary() {
+    echo ""
+    hr
+    warn "Build process aborted. Summary of this run so far:"
+    if [[ ${#INSTALLED[@]} -gt 0 ]]; then
+        info "  Newly installed packages (by this run):"
+        for pkg in $(echo "${!INSTALLED[@]}" | tr ' ' '\n' | sort); do
+            echo "    $pkg"
+        done
+    fi
+    if [[ ${#SKIPPED[@]} -gt 0 ]]; then
+        info "  Packages already installed (skipped):"
+        for pkg in $(echo "${!SKIPPED[@]}" | tr ' ' '\n' | sort); do
+            echo "    $pkg"
+        done
+    fi
+    echo -e "${YELLOW}Note: Some already installed (skipped) packages may be dependencies for other apps you might not want to remove.${NC}"
+    echo ""
+    info "Full log written to: $LOG_FILE"
+}
+
+prompt_on_fail() {
+    local pkg="$1"
+    local parent="$2"
+    error "Build/install failed for $pkg (required by $parent)."
+    read -p "Abort the whole process? (y/N): " abort < /dev/tty
+    if [[ "$abort" =~ ^[Yy]$ ]]; then
+        print_early_summary
+        cleanup 1
+    fi
+}
+
 check_dependencies() {
     local missing=0
-    for cmd in sbopkg grep sed tr find ls wget installpkg compgen; do
+    for cmd in grep sed tr find ls wget installpkg upgradepkg compgen git file readelf md5sum; do
         if ! command -v "$cmd" &>/dev/null; then
             error "Required command '$cmd' not found."
             missing=1
@@ -46,6 +112,10 @@ check_sudo() {
     if [[ $EUID -eq 0 ]]; then
         return 0
     fi
+    if ! command -v sudo &>/dev/null; then
+        error "sudo not found and not running as root. Please run as root or install sudo."
+        cleanup 1
+    fi
     if ! sudo -v; then
         error "sudo failed – do you have proper sudo rights?"
         cleanup 1
@@ -54,26 +124,6 @@ check_sudo() {
         while true; do sudo -n true; sleep 50; done 2>/dev/null
     ) &
     SUDO_PID=$!
-}
-
-check_sbopkg_lock() {
-    local lockfiles=("/tmp/sbopkg.lock" "/var/lock/sbopkg.lock")
-    for lock in "${lockfiles[@]}"; do
-        if [[ -f "$lock" ]]; then
-            warn "Found $lock – another sbopkg process may be running."
-            read -p "Wait for it to finish? (y/N): " choice
-            if [[ "$choice" =~ ^[Yy]$ ]]; then
-                while [[ -f "$lock" ]]; do
-                    sleep 2
-                done
-                info "Lock released, continuing."
-            else
-                error "Please resolve the lock file manually."
-                cleanup 1
-            fi
-            break
-        fi
-    done
 }
 
 get_slackware_version() {
@@ -88,46 +138,174 @@ get_slackware_version() {
     echo "15.0"
 }
 
-# Persistent cache
+
+clone_or_update_sbo() {
+    local branch="$1"
+    if [[ ! -d "$SBO_REPO_DIR/.git" ]]; then
+        hr
+        info "Cloning SlackBuilds repository (branch $branch) into $SBO_REPO_DIR ..."
+        git clone --depth 1 --branch "$branch" \
+            https://gitlab.com/SlackBuilds.org/slackbuilds.git "$SBO_REPO_DIR" 2>&1 | tee -a "$LOG_FILE"
+        if [[ $? -ne 0 ]]; then
+            error "Failed to clone SBo repository."
+            cleanup 1
+        fi
+    else
+        hr
+        info "Updating existing SBo repository (branch $branch) ..."
+        cd "$SBO_REPO_DIR" || cleanup 1
+        git fetch --depth 1 origin "$branch" 2>&1 | tee -a "$LOG_FILE"
+        git checkout "$branch" 2>&1 | tee -a "$LOG_FILE"
+        git reset --hard "origin/$branch" 2>&1 | tee -a "$LOG_FILE"
+        if [[ $? -ne 0 ]]; then
+            error "Failed to update SBo repository."
+            cleanup 1
+        fi
+        cd - >/dev/null
+    fi
+}
+
+sync_alien() {
+    hr
+    info "Syncing AlienBob SlackBuild metadata (essential build scripts) via rsync ..."
+    mkdir -p "$ALIEN_DIR"
+
+    rsync -av --delete --progress --prune-empty-dirs \
+        --exclude='pkg/' \
+        --exclude='pkg64/' \
+        --exclude='oldpkg/' \
+        --exclude='sources/' \
+        --include='*/' \
+        --include='*.SlackBuild' \
+        --include='slack-desc' \
+        --include='slack-required' \
+        --include='README' \
+        --exclude='*' \
+        rsync://slackware.nl/mirrors/people/alien/slackbuilds/ \
+        "$ALIEN_DIR/" 2>&1 | tee -a "$LOG_FILE"
+    stty sane 2>/dev/null
+
+    if [[ $? -ne 0 ]]; then
+        error "Failed to sync AlienBob's SlackBuilds via rsync."
+        cleanup 1
+    fi
+    info "AlienBob SlackBuild metadata synced successfully."
+}
+
+fetch_alien_build_files() {
+    local pkg="$1"
+    local pkg_build_dir="$ALIEN_DIR/$pkg/build"
+    local remote_path="rsync://slackware.nl/mirrors/people/alien/slackbuilds/$pkg/build/"
+
+    if [[ ! -d "$pkg_build_dir" ]]; then
+        warn "AlienBob build directory for $pkg not found locally; cannot fetch."
+        return 1
+    fi
+
+    info "Fetching full build files for $pkg from AlienBob ..."
+    rsync -av --progress "$remote_path" "$pkg_build_dir/" 2>&1 | tee -a "$LOG_FILE"
+    stty sane 2>/dev/null
+    if [[ $? -ne 0 ]]; then
+        error "Failed to fetch build files for $pkg."
+        return 1
+    fi
+    info "Build files for $pkg are up to date."
+}
+
+generate_alien_info() {
+    local slackbuild="$1"
+    local build_dir=$(dirname "$slackbuild")
+    local pkg_name=$(basename "$(dirname "$build_dir")")
+    local info_file="$ALIEN_INFO_DIR/${pkg_name}.info"
+
+    if [[ -f "$info_file" ]] && [[ "$slackbuild" -ot "$info_file" ]]; then
+        echo "$info_file"
+        return
+    fi
+
+    local prgnam
+    prgnam=$(sed -n 's/^[[:space:]]*PRGNAM=["'\''"]\?\([^"'\''[:space:]]*\)["'\''"]\?.*/\1/p' "$slackbuild" | head -1)
+    [[ -z "$prgnam" ]] && prgnam="$pkg_name"
+
+    local version
+    version=$(sed -n 's/^[[:space:]]*VERSION=\${VERSION:-\([^}]*\)}.*/\1/p' "$slackbuild" | head -1)
+    if [[ -z "$version" ]]; then
+        version=$(sed -n 's/^[[:space:]]*VERSION=["'\''"]\?\([^"'\''[:space:]]*\)["'\''"]\?.*/\1/p' "$slackbuild" | head -1)
+    fi
+    [[ -z "$version" ]] && version="unknown"
+
+    local homepage
+    homepage=$(sed -n 's/^[[:space:]]*HOMEPAGE=["'\''"]\?\([^"'\''[:space:]]*\)["'\''"]\?.*/\1/p' "$slackbuild" | head -1)
+    [[ -z "$homepage" ]] && homepage=""
+
+    local srcurl
+    srcurl=$(sed -n 's/^[[:space:]]*SRCURL=["'\''"]\?\([^"'\''[:space:]]*\)["'\''"]\?.*/\1/p' "$slackbuild" | head -1)
+    if [[ -n "$srcurl" ]]; then
+        srcurl=${srcurl//\$\{VERSION\}/$version}
+    fi
+    [[ -z "$srcurl" ]] && srcurl=""
+
+    local requires=""
+    if [[ -f "$build_dir/slack-required" ]]; then
+        requires=$(grep -v '^[[:space:]]*$' "$build_dir/slack-required" | sed 's/#.*//; s/[[:space:]]\+/,/g' | paste -sd, -)
+    fi
+    [[ -z "$requires" ]] && requires="%ALIEN%"
+
+
+    cat > "$info_file" <<EOF
+PRGNAM="$prgnam"
+VERSION="$version"
+HOMEPAGE="$homepage"
+DOWNLOAD="$srcurl"
+REQUIRES="$requires"
+EOF
+
+    echo "$info_file"
+}
+
 declare -A INFO_CACHE
-CACHE_DIR="$HOME/.cache/multisbo"
-mkdir -p "$CACHE_DIR"
 
 load_persistent_cache() {
-    local sbo_dir="/var/lib/sbopkg/SBo/$SBO_VERSION"
-    if [[ ! -d "$sbo_dir" ]]; then
-        error "SBo repository not found at $sbo_dir"
-        error "Please run 'sudo sbopkg -r' to sync."
+    if [[ ! -d "$SBO_REPO_DIR" ]]; then
+        error "Local SlackBuilds repository not found at $SBO_REPO_DIR"
+        error "Please run '$SCRIPT_NAME --sync-sbo' first."
         cleanup 1
     fi
 
-    CACHE_FILE="$CACHE_DIR/${SBO_VERSION}.cache"
+    CACHE_FILE="$CACHE_DIR/${SBO_VERSION}.info_cache"
     if [[ -f "$CACHE_FILE" ]]; then
-        local newest_sbo=$(find "$sbo_dir" -type f -name "*.info" -printf '%T@\n' 2>/dev/null | sort -nr | head -1)
+        local newest_info
+        newest_info=$(find "$SBO_REPO_DIR" -type f -name "*.info" -not -path '*/.git/*' -printf '%T@\n' 2>/dev/null | sort -nr | head -1)
         local cache_mtime=$(stat -c %Y "$CACHE_FILE" 2>/dev/null)
-        if [[ -n "$newest_sbo" ]] && (( $(echo "$cache_mtime > $newest_sbo" | bc -l) )); then
+        local need_rebuild=0
+        if [[ -n "$newest_info" ]] && (( $(echo "$cache_mtime < $newest_info" | bc -l) )); then
+            need_rebuild=1
+        fi
+        if [[ $need_rebuild -eq 0 ]]; then
             source "$CACHE_FILE" 2>/dev/null
             if declare -p INFO_CACHE &>/dev/null; then
-                info "Loaded persistent cache from $CACHE_FILE"
+                info "Loaded persistent info cache from $CACHE_FILE"
                 return 0
             fi
         fi
     fi
-
     build_full_cache
 }
 
+
+
 build_full_cache() {
-    local sbo_dir="/var/lib/sbopkg/SBo/$SBO_VERSION"
-    info "Building full .info file cache (this may take a few seconds)..."
+    hr
+    info "Building .info file cache (SBo only – AlienBob info is generated on demand)..."
     INFO_CACHE=()
     local count=0
+
     while IFS= read -r -d '' info; do
         local pkg_name=$(basename "$info" .info)
         INFO_CACHE["$pkg_name"]="$info"
         ((count++))
-    done < <(find "$sbo_dir" -type f -name "*.info" -print0 2>/dev/null)
-    info "Cached $count package info files."
+    done < <(find "$SBO_REPO_DIR" -type f -name "*.info" -not -path '*/.git/*' -print0 2>/dev/null)
+    info "Cached $count SBo info files."
 
     {
         echo "declare -A INFO_CACHE=("
@@ -141,27 +319,57 @@ build_full_cache() {
 
 add_to_cache() {
     local pkg="$1"
-    local sbo_dir="/var/lib/sbopkg/SBo/$SBO_VERSION"
-    local info_file=$(find "$sbo_dir" -maxdepth 3 -type f -name "${pkg}.info" -print -quit 2>/dev/null)
+    local info_file
+
+    if [[ $PREFER_ALIEN -eq 1 && -d "$ALIEN_DIR" ]]; then
+        local try_sb=$(find "$ALIEN_DIR/$pkg/build" -maxdepth 1 -name "*.SlackBuild" -print -quit 2>/dev/null)
+        if [[ -n "$try_sb" ]]; then
+            info_file=$(generate_alien_info "$try_sb")
     if [[ -n "$info_file" ]]; then
         INFO_CACHE["$pkg"]="$info_file"
         printf "INFO_CACHE[%q]=%q\n" "$pkg" "$info_file" >> "$CACHE_FILE"
         return 0
-    else
-        return 1
+            fi
+        fi
     fi
+
+    info_file=$(find "$SBO_REPO_DIR" -maxdepth 3 -type f -name "${pkg}.info" -not -path '*/.git/*' -print -quit 2>/dev/null)
+    if [[ -n "$info_file" ]]; then
+        INFO_CACHE["$pkg"]="$info_file"
+        printf "INFO_CACHE[%q]=%q\n" "$pkg" "$info_file" >> "$CACHE_FILE"
+        return 0
+    fi
+
+    if [[ $PREFER_ALIEN -eq 0 && -d "$ALIEN_DIR" ]]; then
+        local try_sb2=$(find "$ALIEN_DIR/$pkg/build" -maxdepth 1 -name "*.SlackBuild" -print -quit 2>/dev/null)
+        if [[ -n "$try_sb2" ]]; then
+            info_file=$(generate_alien_info "$try_sb2")
+            if [[ -n "$info_file" ]]; then
+                INFO_CACHE["$pkg"]="$info_file"
+                printf "INFO_CACHE[%q]=%q\n" "$pkg" "$info_file" >> "$CACHE_FILE"
+                return 0
+            fi
+        fi
+    fi
+    return 1
 }
 
 get_info_file() {
     local pkg="$1"
     if [[ -n "${INFO_CACHE[$pkg]}" ]]; then
+        if [[ -f "${INFO_CACHE[$pkg]}" && -s "${INFO_CACHE[$pkg]}" ]]; then
+            echo "${INFO_CACHE[$pkg]}"
+            return
+        else
+            unset "INFO_CACHE[$pkg]"
+            log "Removed stale info_cache entry for $pkg"
+        fi
+    fi
+
+    if add_to_cache "$pkg"; then
         echo "${INFO_CACHE[$pkg]}"
     else
-        if add_to_cache "$pkg"; then
-            echo "${INFO_CACHE[$pkg]}"
-        else
-            echo ""
-        fi
+        echo ""
     fi
 }
 
@@ -172,6 +380,9 @@ parse_requires() {
         return
     fi
     req_line=$(echo "$req_line" | sed -E 's/^REQUIRES=//; s/^"//; s/"$//; s/^\x27//; s/\x27$//')
+    if [[ "$req_line" == "%ALIEN%" ]]; then
+        return
+    fi
     req_line=$(echo "$req_line" | tr ',' ' ')
     local deps=()
     for dep in $req_line; do
@@ -183,14 +394,968 @@ parse_requires() {
 
 check_installed() {
     local pkg="$1"
-    compgen -G "/var/log/packages/${pkg}-*" >/dev/null && return 0
+    if compgen -G "/var/log/packages/${pkg}-[0-9]*" >/dev/null 2>&1; then
+        return 0
+    fi
+    if [[ "$pkg" == python3-* ]]; then
+        local py2name="python-${pkg#python3-}"
+        if compgen -G "/var/log/packages/${py2name}-[0-9]*" >/dev/null 2>&1; then
+            warn "Assuming '$pkg' is provided by installed package '$py2name'."
+            return 0
+        fi
+    fi
     return 1
+}
+
+get_current_version() {
+    local pkg="$1"
+    local pkg_file=$(ls /var/log/packages/${pkg}-* 2>/dev/null | head -1)
+    if [[ -z "$pkg_file" ]]; then
+        echo ""
+        return 1
+    fi
+    local fullname=$(basename "$pkg_file")
+    local rest="${fullname#$pkg-}"
+    local version=$(echo "$rest" | cut -d- -f1)
+    local build=$(echo "$rest" | cut -d- -f3)
+    [[ -n "$build" ]] || build="1"
+    echo "${version}-${build}"
+}
+
+get_available_version() {
+    local pkg="$1"
+    local info_file=$(get_info_file "$pkg")
+    if [[ -z "$info_file" ]]; then
+        echo ""
+        return 1
+    fi
+    source "$info_file" 2>/dev/null
+    if [[ -z "$VERSION" ]]; then
+        echo ""
+        return 1
+    fi
+    local BUILD="${BUILD:-1}"
+    echo "${VERSION}-${BUILD}"
+}
+
+normalize_version() {
+    local ver="$1"
+    echo "$ver" | sed 's/_[A-Za-z0-9]*$//'
+}
+
+compare_versions() {
+    local current="$1"
+    local available="$2"
+    local norm_current=$(normalize_version "$current")
+    local norm_available=$(normalize_version "$available")
+    if [[ "$norm_current" != "$norm_available" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+declare -A ELF_PROVIDES
+declare -A ELF_NEEDS
+declare -A ELF_TIMESTAMPS
+
+ELF_CACHE_FILE="$CACHE_DIR/elf_deps.txt"
+ELF_TS_FILE="$CACHE_DIR/elf_ts.cache"
+ELF_PKG_DIR_MTIME_FILE="$CACHE_DIR/elf_pkgdir_mtime"
+
+save_elf_caches() {
+    > "$ELF_CACHE_FILE"
+    for pkg in "${!ELF_PROVIDES[@]}"; do
+        printf "P %q %s\n" "$pkg" "${ELF_PROVIDES[$pkg]}" >> "$ELF_CACHE_FILE"
+    done
+    for pkg in "${!ELF_NEEDS[@]}"; do
+        printf "N %q %s\n" "$pkg" "${ELF_NEEDS[$pkg]}" >> "$ELF_CACHE_FILE"
+    done
+    declare -p ELF_TIMESTAMPS > "$ELF_TS_FILE"
+}
+
+elf_fingerprint() {
+    (
+        cd /var/log/packages 2>/dev/null || exit 1
+        stat -c '%Y %n' -- * 2>/dev/null | md5sum
+    )
+}
+
+elf_cache_fresh() {
+    local fp_file="$CACHE_DIR/elf_fingerprint"
+    local current_dir_mtime
+    current_dir_mtime=$(stat -c %Y /var/log/packages 2>/dev/null) || return 1
+
+    local saved_dir_mtime
+    if [[ -f "$ELF_PKG_DIR_MTIME_FILE" ]]; then
+        saved_dir_mtime=$(cat "$ELF_PKG_DIR_MTIME_FILE")
+        if [[ "$current_dir_mtime" == "$saved_dir_mtime" ]]; then
+            return 0
+        fi
+    fi
+
+    local current_fp
+    current_fp=$(elf_fingerprint) || return 1
+    if [[ -f "$fp_file" ]] && [[ "$(cat "$fp_file")" == "$current_fp" ]]; then
+        echo "$current_dir_mtime" > "$ELF_PKG_DIR_MTIME_FILE"
+        return 0
+    else
+        echo "$current_fp" > "$fp_file"
+        return 1
+    fi
+}
+
+load_elf_data_flat() {
+    ELF_PROVIDES=()
+    ELF_NEEDS=()
+    while IFS=' ' read -r type pkgkey rest; do
+        pkg=$(printf '%b' "$pkgkey")
+        case "$type" in
+            P) ELF_PROVIDES["$pkg"]="$rest" ;;
+            N) ELF_NEEDS["$pkg"]="$rest" ;;
+        esac
+    done < "$ELF_CACHE_FILE"
+}
+
+
+get_ld_library_paths() {
+    (
+        if [[ -f /etc/ld.so.conf ]]; then
+            while read -r line; do
+                case "$line" in
+                    include*) 
+                        for f in ${line#*include }; do
+                            [[ -f "$f" ]] && cat "$f"
+                        done ;;
+                    /*) echo "$line" ;;
+                esac
+            done < /etc/ld.so.conf
+        fi
+        echo /lib
+        echo /usr/lib
+    ) | sort -u
+}
+
+LD_PATH_LIST=$(get_ld_library_paths | tr '\n' ' ')
+
+rescan_package() {
+    local pkgname="$1"
+    local pkgfile="$2"
+    unset "ELF_PROVIDES[$pkgname]"
+    unset "ELF_NEEDS[$pkgname]"
+    unset "ELF_TIMESTAMPS[$pkgname]"
+    [[ ! -f "$pkgfile" ]] && return
+
+    local tmp=$(mktemp)
+
+    grep -E '(\./)?(usr/)?(lib[^/]*\.|libexec/|games/|bin/|sbin/)|\.so' "$pkgfile" 2>/dev/null \
+    | sed 's#^\./##' | while read -r f; do
+        abs="/$f"
+        [[ -f "$abs" ]] || continue
+        echo "$abs"
+    done | sort -u > "$tmp.files"
+
+    local parallel_jobs=1
+    xargs -a "$tmp.files" -P "$parallel_jobs" -I {} env LD_PATH_LIST="$LD_PATH_LIST" sh -c '
+        path="{}"
+        soname=""; needed=""
+        readelf -h "$path" >/dev/null 2>&1 || exit 0
+        if [[ "$path" == *.so.* ]]; then
+            soname=$(readelf -d "$path" 2>/dev/null | grep SONAME | awk -F"[][]" "{print \$2}")
+        fi
+        needed=$(readelf -d "$path" 2>/dev/null | grep NEEDED | awk "{print \$NF}" | sed "s/\[//;s/\]//" || true)
+
+        # Only record PROVIDES for libraries in standard system directories
+        if [[ -n "$soname" ]]; then
+            dir=$(dirname "$path")
+            for ld in ${LD_PATH_LIST}; do
+                if [[ "$dir" == "$ld" ]]; then
+                    echo "PROV ${soname}:$dir"
+                    break
+                fi
+            done
+        fi
+
+        for n in $needed; do
+            [[ -n "$n" ]] && echo "NEED $n"
+        done
+    ' _ > "$tmp.out" 2>/dev/null
+
+    local provides=() needs=()
+    while read -r type value; do
+        case "$type" in
+            PROV) provides+=("$value") ;;
+            NEED) needs+=("$value") ;;
+        esac
+    done < "$tmp.out"
+
+    rm -f "$tmp.files" "$tmp.out"
+
+    if [[ ${#provides[@]} -gt 0 ]]; then
+        ELF_PROVIDES["$pkgname"]="${provides[*]}"
+    fi
+    if [[ ${#needs[@]} -gt 0 ]]; then
+        ELF_NEEDS["$pkgname"]="${needs[*]}"
+    fi
+    ELF_TIMESTAMPS["$pkgname"]=$(stat -c %Y "$pkgfile" 2>/dev/null)
+}
+
+deduplicate_providers() {
+    local -A soname_dir_pkg
+    local -A soname_dir_conflict
+
+    for pkg in "${!ELF_PROVIDES[@]}"; do
+        for entry in ${ELF_PROVIDES[$pkg]}; do
+            local soname="${entry%%:*}"
+            local dir="${entry#*:}"
+            local key="${soname}:${dir}"
+            if [[ -z "${soname_dir_pkg[$key]}" ]]; then
+                soname_dir_pkg["$key"]="$pkg"
+            elif [[ "${soname_dir_pkg[$key]}" != "$pkg" ]]; then
+                soname_dir_conflict["$key"]=1
+            fi
+        done
+    done
+
+    for pkg in "${!ELF_PROVIDES[@]}"; do
+        local new_provides=()
+        for entry in ${ELF_PROVIDES[$pkg]}; do
+            local soname="${entry%%:*}"
+            local dir="${entry#*:}"
+            local key="${soname}:${dir}"
+            if [[ -z "${soname_dir_conflict[$key]}" ]]; then
+                new_provides+=("$entry")
+            fi
+        done
+        if [[ ${#new_provides[@]} -eq 0 ]]; then
+            unset "ELF_PROVIDES[$pkg]"
+        else
+            ELF_PROVIDES["$pkg"]="${new_provides[*]}"
+        fi
+    done
+}
+
+build_elf_cache() {
+    local cache="$1"
+    hr
+    info "Building ELF dependency cache (full scan – required once)..."
+    ELF_PROVIDES=()
+    ELF_NEEDS=()
+    ELF_TIMESTAMPS=()
+    local pkg pkgname count=0 total=0
+    for pkgfile in /var/log/packages/*; do ((total++)); done
+    for pkgfile in /var/log/packages/*; do
+        pkg=$(basename "$pkgfile")
+        pkgname=$(echo "$pkg" | sed -E 's/-[^-]+-[^-]+-[^-]+$//')
+        [[ -z "$pkgname" ]] && pkgname="$pkg"
+        ((count++))
+        printf "  [%d/%d] %s%-80s\r" "$count" "$total" "$pkgname" "" >&2
+        echo "SCANNING $pkgname" >> /tmp/scan.log
+        rescan_package "$pkgname" "$pkgfile"
+                
+    done
+    printf "  Scanning [%d/%d] done.                    \n" "$total" "$total" >&2
+    deduplicate_providers
+    save_elf_caches
+    info "ELF cache saved to $ELF_CACHE_FILE"
+
+    local fp
+    fp=$(elf_fingerprint) || return 1
+    echo "$fp" > "$CACHE_DIR/elf_fingerprint"
+    stat -c %Y /var/log/packages > "$ELF_PKG_DIR_MTIME_FILE" 2>/dev/null
+}
+
+load_elf_cache() {
+    if [[ ! -f "$ELF_CACHE_FILE" ]]; then
+        build_elf_cache
+        return 0
+    fi
+    if elf_cache_fresh; then
+        load_elf_data_flat
+        [[ -f "$ELF_TS_FILE" ]] && source "$ELF_TS_FILE"
+        info "ELF cache is up to date (instant). ($(ls /var/log/packages 2>/dev/null | wc -l) packages scanned)."
+        return 0
+    fi
+    load_elf_data_flat
+    [[ -f "$ELF_TS_FILE" ]] && source "$ELF_TS_FILE"
+    info "Updating ELF dependency cache (incremental scan)..."
+    local current_installed=()
+    declare -A current_mtimes
+    for pkgfile in /var/log/packages/*; do
+        local pkg=$(basename "$pkgfile")
+        local pkgname=$(echo "$pkg" | sed -E 's/-[^-]+-[^-]+-[^-]+$//')
+        [[ -z "$pkgname" ]] && pkgname="$pkg"
+        current_installed+=("$pkgname")
+        current_mtimes["$pkgname"]=$(stat -c %Y "$pkgfile" 2>/dev/null)
+    done
+    local changed=0
+    for pkgname in "${current_installed[@]}"; do
+        if [[ -z "${ELF_TIMESTAMPS[$pkgname]}" ]]; then
+            changed=1
+            rescan_package "$pkgname" "/var/log/packages/$(ls /var/log/packages/${pkgname}-* 2>/dev/null | head -1)"
+        elif [[ "${current_mtimes[$pkgname]}" != "${ELF_TIMESTAMPS[$pkgname]}" ]]; then
+            changed=1
+            rescan_package "$pkgname" "/var/log/packages/$(ls /var/log/packages/${pkgname}-* 2>/dev/null | head -1)"
+        fi
+    done
+    for pkgname in "${!ELF_TIMESTAMPS[@]}"; do
+        if [[ ! " ${current_installed[*]} " =~ " $pkgname " ]]; then
+            changed=1
+            unset "ELF_PROVIDES[$pkgname]"
+            unset "ELF_NEEDS[$pkgname]"
+            unset "ELF_TIMESTAMPS[$pkgname]"
+        fi
+    done
+        
+    deduplicate_providers
+    if [[ $changed -eq 1 ]]; then
+        save_elf_caches
+        info "ELF cache updated incrementally (changes detected). ($(ls /var/log/packages 2>/dev/null | wc -l) packages scanned)."
+    else
+        save_elf_caches
+        info "ELF cache is up to date."
+    fi
+}
+
+get_elf_users() {
+    local pkg="$1"
+    local target_basename="${pkg%%-*-*-*}"
+    local pkgfile=$(ls /var/log/packages/${target_basename}-* 2>/dev/null | head -1)
+    [[ -z "$pkgfile" ]] && return 1
+
+    local ld_paths=($(get_ld_library_paths))
+
+    local provides=()
+    while IFS= read -r f; do
+        local abs="/$f"
+        [[ "$abs" != *.so.* ]] && continue
+        [[ ! -f "$abs" ]] && continue
+        if ! readelf -h "$abs" &>/dev/null; then continue; fi
+
+        local dir=$(dirname "$abs")
+        local in_ld=0
+        for ld in "${ld_paths[@]}"; do
+            [[ "$dir" == "$ld" ]] && { in_ld=1; break; }
+        done
+        [[ $in_ld -eq 0 ]] && continue
+
+        local soname=$(readelf -d "$abs" 2>/dev/null | grep SONAME | awk -F'[][]' '{print $2}')
+        [[ -n "$soname" ]] && provides+=("$soname")
+    done < "$pkgfile"
+
+    [[ ${#provides[@]} -eq 0 ]] && return 1
+
+    local users=()
+    for other in "${!ELF_NEEDS[@]}"; do
+        [[ "$other" == "$target_basename" ]] && continue
+        local needs_str="${ELF_NEEDS[$other]}"
+        for soname in "${provides[@]}"; do
+            if [[ "$needs_str" == *"$soname"* ]]; then
+                users+=("$other")
+                break
+            fi
+        done
+    done
+    echo "${users[@]}"
+}
+
+get_native_libdir() {
+    if [[ -d /usr/lib64 ]]; then
+        echo /usr/lib64
+    else
+        echo /usr/lib
+    fi
+}
+
+declare -A SONAME_MAP
+load_soname_map() {
+    local libdir="$1"
+    SONAME_MAP=()
+    for pkg in "${!ELF_PROVIDES[@]}"; do
+        for entry in ${ELF_PROVIDES[$pkg]}; do
+            local soname="${entry%%:*}"
+            local dir="${entry#*:}"
+            if [[ "$dir" == "$libdir" ]]; then
+                if [[ -z "${SONAME_MAP[$soname]}" ]]; then
+                    SONAME_MAP["$soname"]="$pkg"
+                else
+                    SONAME_MAP["$soname"]+=" $pkg"
+                fi
+            fi
+        done
+    done
+}
+
+get_elf_runtime_providers() {
+    local target="$1"
+    local -a providers=()
+    local -A seen
+    if [[ -n "${ELF_NEEDS[$target]}" ]]; then
+        for soname in ${ELF_NEEDS[$target]}; do
+            [[ -z "${SONAME_MAP[$soname]}" ]] && continue
+            for prov in ${SONAME_MAP[$soname]}; do
+                if [[ -z "${seen[$prov]}" ]]; then
+                    seen["$prov"]=1
+                    providers+=("$prov")
+                fi
+            done
+        done
+    fi
+    echo "${providers[@]}"
+}
+
+get_elf_reverse_deps() {
+    local target="$1"
+    local -a result=()
+    local -A visited
+    local -a queue=("$target")
+    while [[ ${#queue[@]} -gt 0 ]]; do
+        local current="${queue[0]}"
+        queue=("${queue[@]:1}")
+        local users=($(get_elf_users "$current"))
+        for u in "${users[@]}"; do
+            if check_installed "$u" && [[ -z "${visited[$u]}" ]] && [[ "$u" != "$target" ]]; then
+                visited["$u"]=1
+                result+=("$u")
+                queue+=("$u")
+            fi
+        done
+    done
+    echo "${result[@]}"
+}
+
+get_elf_orphans() {
+    local target="$1"
+    shift
+    local -a candidates=("$@")
+    local -A orphan_set
+    local -A visited
+    local -a stack=("${candidates[@]}")
+    while [[ ${#stack[@]} -gt 0 ]]; do
+        local pkg="${stack[0]}"
+        stack=("${stack[@]:1}")
+        [[ -n "${visited[$pkg]}" ]] && continue
+        visited["$pkg"]=1
+        local users=($(get_elf_users "$pkg"))
+        local needed_by_other=0
+        for u in "${users[@]}"; do
+            if [[ "$u" != "$target" ]] && ! [[ -n "${orphan_set[$u]}" ]]; then
+                if check_installed "$u"; then
+                    needed_by_other=1
+                    break
+                fi
+            fi
+        done
+        if [[ $needed_by_other -eq 0 ]]; then
+            orphan_set["$pkg"]=1
+            local deps=($(get_elf_runtime_providers "$pkg"))
+            for dep in "${deps[@]}"; do
+                [[ -z "${visited[$dep]}" ]] && stack+=("$dep")
+            done
+        fi
+    done
+    echo "${!orphan_set[@]}"
+}
+
+
+declare -A TREE_VISITED
+declare -A FWD_VISITED
+
+print_tree() {
+    local pkg="$1"
+    local prefix="$2"
+    local depth="$3"
+    local mode="$4"
+
+    if [[ $depth -gt 10 ]]; then
+        echo -e "${prefix}└── ${YELLOW}(max depth)${NC}"
+        return
+    fi
+
+
+    local -n visited=TREE_VISITED
+    [[ "$mode" == "forward" ]] && local -n visited=FWD_VISITED
+
+        if [[ -n "${visited[$pkg]}" ]]; then
+        if [[ "$mode" == "combined" || "$mode" == "forward" ]]; then
+            return
+        fi
+        echo -e "${prefix}└── ${YELLOW}(already shown)${NC}"
+        return
+    fi
+    visited["$pkg"]=1
+
+    local users=()
+
+    if [[ "$mode" == "elf" ]]; then
+        users=($(get_elf_users "$pkg"))
+    elif [[ "$mode" == "combined" ]]; then
+        local elves=($(get_elf_users "$pkg"))
+        local reqs=(${REV_REQUIRES[$pkg]})
+        users=("${elves[@]}" "${reqs[@]}")
+    elif [[ "$mode" == "inspect" ]]; then
+        local elves=($(get_elf_users "$pkg"))
+        local reqs=(${REV_REQUIRES[$pkg]})
+        for u in "${elves[@]}" "${reqs[@]}"; do
+            [[ -z "$u" ]] && continue
+            [[ " ${users[*]} " == *" $u "* ]] && continue
+            users+=("$u")
+        done
+    elif [[ "$mode" == "forward" ]]; then
+        users=(${FWD_REQUIRES[$pkg]})
+    fi
+
+    local total=${#users[@]}
+    local count=0
+
+    for user in "${users[@]}"; do
+        [[ -z "$user" ]] && continue
+        ((count++))
+        local branch="├──"
+        [[ $count -eq $total ]] && branch="└──"
+
+        local label=""
+        if [[ "$mode" == "combined" ]]; then
+            if [[ -n "${INSTALLED_DEPS[$user]}" ]]; then
+                label="${GREEN}${user}${NC} (will be removed)"
+            else
+                label="${RED}${user}${NC} (outside removal set)"
+            fi
+        elif [[ "$mode" == "inspect" ]]; then
+            local kind="build"
+            local elves=($(get_elf_users "$pkg"))
+            if [[ " ${elves[*]} " == *" $user "* ]]; then kind="runtime"; fi
+            local status="not installed"
+            check_installed "$user" && status="installed"
+            local color="$GREEN"
+            [[ "$status" == "not installed" ]] && color="$RED"
+            label="${color}${user}${NC} ($kind, $status)"
+        elif [[ "$mode" == "forward" ]]; then
+            local status="not installed"
+            check_installed "$user" && status="installed"
+            local color="$GREEN"
+            [[ "$status" == "not installed" ]] && color="$RED"
+            label="${color}${user}${NC} (needs, $status)"
+        elif [[ "$mode" == "removal_forward" ]]; then
+            local runtime="${REV_OUTSIDE_RUNTIME[$user]}"
+            local build="${REV_OUTSIDE_BUILD[$user]}"
+            if [[ -n "$runtime" ]]; then
+                label="${RED}${user}${NC} (NOT safe – runtime deps: $runtime)"
+            elif [[ -n "$build" ]]; then
+                label="${YELLOW}${user}${NC} (safe for runtime, needed to build: $build)"
+            else
+                label="${GREEN}${user}${NC} (safe to remove)"
+            fi
+        else
+            local status="not installed"
+            check_installed "$user" && status="installed"
+            local color="$GREEN"
+            [[ "$status" == "not installed" ]] && color="$RED"
+            label="${color}${user}${NC} ($status)"
+        fi
+
+        echo -e "${prefix}${branch} $label"
+
+        local new_prefix="$prefix"
+        [[ $count -eq $total ]] && new_prefix+="    " || new_prefix+="│   "
+        print_tree "$user" "$new_prefix" $((depth + 1)) "$mode"
+    done
+}
+
+
+build_dependency_maps() {
+    declare -gA REV_REQUIRES
+    declare -gA FWD_REQUIRES
+    REV_REQUIRES=()
+    FWD_REQUIRES=()
+
+    for pkgfile in /var/log/packages/*; do
+        local pkgfull=$(basename "$pkgfile")
+        local pkgname=$(echo "$pkgfull" | sed -E 's/-[^-]+-[^-]+-[^-]+$//')
+        [[ -z "$pkgname" ]] && pkgname="${pkgfull%%-*}"
+
+        local deps=()
+        if [[ -n "${INFO_CACHE[$pkgname]}" ]] && [[ -f "${INFO_CACHE[$pkgname]}" ]]; then
+            deps=($(parse_requires "${INFO_CACHE[$pkgname]}"))
+        fi
+        if [[ ${#deps[@]} -eq 0 ]] && [[ -f "$ALIEN_DIR/$pkgname/build/slack-required" ]]; then
+            deps=($(grep -v '^[[:space:]]*$' "$ALIEN_DIR/$pkgname/build/slack-required" \
+                     | sed 's/#.*//; s/[[:space:]]\+/,/g' | tr ',' ' '))
+        fi
+
+        [[ ${#deps[@]} -gt 0 ]] && FWD_REQUIRES["$pkgname"]="${deps[*]}"
+
+        for dep in "${deps[@]}"; do
+            [[ -z "$dep" ]] && continue
+            if [[ -z "${REV_REQUIRES[$dep]}" ]]; then
+                REV_REQUIRES["$dep"]="$pkgname"
+            else
+                REV_REQUIRES["$dep"]+=" $pkgname"
+            fi
+        done
+    done
+}
+
+print_orphan_tree() {
+    local target="$1" indent="$2" label="$3"
+    local -a orphans=("${@:4}")
+    local -A IS_ORPHAN
+    for p in "${orphans[@]}"; do IS_ORPHAN["$p"]=1; done
+
+    echo -e "${indent}${target} (${label})"
+
+    local -a direct_orphans=()
+    for prov in $(get_elf_runtime_providers "$target"); do
+        [[ -n "${IS_ORPHAN[$prov]}" ]] && direct_orphans+=("$prov")
+    done
+    local -a sorted_direct=($(printf '%s\n' "${direct_orphans[@]}" | sort -u))
+
+    _print_orphan_children() {
+        local pkg="$1" prefix="$2" depth="$3"
+        [[ $depth -gt 10 ]] && return
+
+        local -a children=()
+        if [[ -n "${ELF_NEEDS[$pkg]}" ]]; then
+            for soname in ${ELF_NEEDS[$pkg]}; do
+                [[ -z "${SONAME_MAP[$soname]}" ]] && continue
+                local child="${SONAME_MAP[$soname]}"
+                [[ "$child" == "$pkg" ]] && continue
+                if [[ -n "${IS_ORPHAN[$child]}" || "$child" == "$target" ]]; then
+                    children+=("$child")
+                fi
+            done
+        fi
+
+        local -A seen
+        local -a uniq=()
+        for c in "${children[@]}"; do [[ -n "${seen[$c]}" ]] && continue; seen["$c"]=1; uniq+=("$c"); done
+        local total=${#uniq[@]}; local count=0
+        for c in $(printf '%s\n' "${uniq[@]}" | sort); do
+            ((count++))
+            local branch="├──"; local newp="$prefix│   "
+            [[ $count -eq $total ]] && branch="└──" newp="$prefix    "
+            if [[ "$c" == "$target" ]]; then
+                echo -e "${prefix}${branch} ${target} (to be removed)"
+            else
+                echo -e "${prefix}${branch} ${GREEN}${c}${NC} (orphan)"
+            fi
+            _print_orphan_children "$c" "$newp" $((depth+1))
+        done
+    }
+
+    local total=${#sorted_direct[@]}; local count=0
+    for child in "${sorted_direct[@]}"; do
+        ((count++))
+        local branch="├──"; local newp="${indent}│   "
+        [[ $count -eq $total ]] && branch="└──" newp="${indent}    "
+        echo -e "${indent}${branch} ${GREEN}${child}${NC} (orphan)"
+        _print_orphan_children "$child" "$newp" 1
+    done
+}
+
+show_dependency_report() {
+    local target="$1"
+    local target_basename="${target%%-*-*-*}"
+
+    local pkgfile=$(ls /var/log/packages/${target_basename}-* 2>/dev/null | head -1)
+
+    local old_pref=$PREFER_ALIEN
+    PREFER_ALIEN=1
+    build_dependency_maps
+    PREFER_ALIEN=$old_pref
+
+    if [[ -n "$pkgfile" ]]; then
+        local libdir=$(get_native_libdir)
+        load_soname_map "$libdir"
+
+        hr
+        info "Packages that depend on '$target' at runtime:"
+        local -a rev_deps=($(get_elf_reverse_deps "$target"))
+        if [[ ${#rev_deps[@]} -gt 0 ]]; then
+            echo -e "  ${GREEN}$target${NC} (installed)"
+            for dep in "${rev_deps[@]}"; do
+                echo -e "  ├── ${RED}${dep}${NC} (installed)"
+            done
+        else
+            echo "  (none)"
+        fi
+
+        hr
+        info "Packages that '$target' needs, and that are NOT used by anything else:"
+        local -a direct_providers=($(get_elf_runtime_providers "$target"))
+        local -a orphans=($(get_elf_orphans "$target" "${direct_providers[@]}"))
+        if [[ ${#direct_providers[@]} -gt 0 ]]; then
+            if [[ ${#orphans[@]} -gt 0 ]]; then
+                print_orphan_tree "$target" "  " "installed" "${orphans[@]}"
+            else
+                echo "  (all runtime dependencies are shared with other packages)"
+            fi
+        else
+            echo "  (none)"
+        fi
+
+        local -a shared=()
+        for prov in "${direct_providers[@]}"; do
+            local is_orphan=0
+            for o in "${orphans[@]}"; do [[ "$prov" == "$o" ]] && { is_orphan=1; break; }; done
+            [[ $is_orphan -eq 0 && "$prov" != "$target" ]] && shared+=("$prov")
+        done
+        if [[ ${#shared[@]} -gt 0 ]]; then
+            echo ""
+            info "  These are also needed at runtime, but are shared with other packages:"
+            printf '    %s\n' "${shared[@]}"
+        fi
+    else
+        echo ""
+        warn "Package '$target' is not installed – showing build‑time dependencies only."
+    fi
+
+    hr
+    info "Packages that '$target' depends on at build time:"
+
+    if [[ -z "${FWD_REQUIRES[$target]}" ]]; then
+        local deps=()
+
+        local info_file=$(get_info_file "$target")
+        if [[ -n "$info_file" && -f "$info_file" ]]; then
+            deps=($(parse_requires "$info_file"))
+        fi
+
+        if [[ ${#deps[@]} -eq 0 ]] && [[ -f "$ALIEN_DIR/$target/build/slack-required" ]]; then
+            deps=($(grep -v '^[[:space:]]*$' "$ALIEN_DIR/$target/build/slack-required" \
+                     | sed 's/#.*//; s/[[:space:]]\+/,/g' | tr ',' ' '))
+        fi
+        [[ ${#deps[@]} -gt 0 ]] && FWD_REQUIRES["$target"]="${deps[*]}"
+    fi
+
+    if [[ -n "${FWD_REQUIRES[$target]}" ]]; then
+        echo -e "  ${GREEN}$target${NC} (${pkgfile:+installed}${pkgfile:-not installed})"
+        FWD_VISITED=()
+        print_tree "$target" "  " 0 "forward"
+    else
+        echo "  (no build‑time dependencies found in SBo or AlienBob)"
+    fi
+}
+
+declare -A DEP_COLLECTED
+collect_dependencies() {
+    local pkg="$1"
+    if [[ -n "${DEP_COLLECTED[$pkg]}" ]]; then return; fi
+    DEP_COLLECTED["$pkg"]=1
+    local info_file=$(get_info_file "$pkg")
+    [[ -z "$info_file" ]] && return
+    local deps=($(parse_requires "$info_file"))
+    for dep in "${deps[@]}"; do
+        collect_dependencies "$dep"
+    done
+}
+
+do_removal() {
+    local target="$1"
+    if ! check_installed "$target"; then
+        error "Package '$target' is not installed."
+        return 1
+    fi
+
+    load_elf_cache
+    local libdir=$(get_native_libdir)
+    load_soname_map "$libdir"
+
+    local -a breakage_list=($(get_elf_reverse_deps "$target"))
+
+    local -a target_providers=($(get_elf_runtime_providers "$target"))
+    local -a orphans=($(get_elf_orphans "$target" "${target_providers[@]}"))
+    local -A IS_ORPHAN
+    for p in "${orphans[@]}"; do IS_ORPHAN["$p"]=1; done
+
+    hr
+    info "Removal analysis for '$target' (runtime only):"
+    echo ""
+
+    if [[ ${#breakage_list[@]} -gt 0 ]]; then
+        echo -e "  ${RED}${target}${NC} (installed) would break these packages:"
+
+        local -A REV_VISITED
+        print_rev_children() {
+            local pkg="$1" prefix="$2"
+            local dep_users=($(get_elf_users "$pkg"))
+            local children=()
+            for u in "${dep_users[@]}"; do
+                if [[ -n "${REV_VISITED[$u]}" || "$u" == "$target" ]]; then continue; fi
+                if check_installed "$u"; then
+                    children+=("$u")
+                fi
+            done
+            local total=${#children[@]}
+            local count=0
+            for child in $(printf '%s\n' "${children[@]}" | sort -u); do
+                ((count++))
+                local branch="├──"
+                local new_prefix="$prefix│   "
+                [[ $count -eq $total ]] && branch="└──" new_prefix="$prefix    "
+
+                if [[ -n "${REV_VISITED[$child]}" ]]; then
+                    echo -e "${prefix}${branch} ${YELLOW}${child} (already shown)${NC}"
+                    continue
+                fi
+                REV_VISITED["$child"]=1
+                echo -e "${prefix}${branch} ${RED}${child}${NC} (installed)"
+                print_rev_children "$child" "$new_prefix"
+            done
+        }
+        print_rev_children "$target" "  "
+    else
+        echo -e "  ${GREEN}${target}${NC} (installed) → no runtime dependents."
+    fi
+
+    if [[ ${#target_providers[@]} -gt 0 ]]; then
+        if [[ ${#orphans[@]} -gt 0 ]]; then
+            echo ""
+            echo "  Forward dependency tree (only packages that would become unused):"
+            print_orphan_tree "$target" " " "to be removed" "${orphans[@]}"
+        else
+            echo ""
+            echo "  Forward dependencies exist, but none are exclusive (shared with other packages)."
+        fi
+    fi
+
+    local -a orphan_list_sorted=(${!IS_ORPHAN[@]})
+    if [[ ${#orphan_list_sorted[@]} -gt 0 ]]; then
+        IFS=$'\n' orphan_list_sorted=($(printf '%s\n' "${orphan_list_sorted[@]}" | sort))
+    fi
+
+    echo ""
+    echo "Select action:"
+    echo "  1) Remove only '$target' (keep all dependencies)"
+    if (( ${#orphan_list_sorted[@]} == 0 )); then
+        echo "  2) Remove '$target' and all orphaned packages (none found)"
+    else
+        echo "  2) Remove '$target' and all orphaned packages:"
+        printf '       %s\n' "${orphan_list_sorted[@]}"
+    fi
+    echo "  3) Cancel"
+    read -p "Your choice [1-3]: " action
+
+    case "$action" in
+        1)
+            if [[ ${#breakage_list[@]} -gt 0 ]]; then
+                echo -e "${YELLOW}WARNING: Removing '$target' will BREAK the packages listed above.${NC}"
+                read -p "Are you sure? (y/N): " confirm
+                [[ "$confirm" =~ ^[Yy]$ ]] || { info "Removal cancelled."; return 1; }
+            fi
+            hr
+            info "Removing $target ..."
+            run_privileged removepkg "$target"
+            ;;
+        2)
+            local to_remove=()
+            if [[ ${#breakage_list[@]} -eq 0 ]]; then
+                to_remove+=("$target")
+            else
+                echo -e "${YELLOW}WARNING: '$target' has transitive dependents; it will NOT be removed automatically.${NC}"
+                read -p "Include '$target' anyway? (y/N): " include_target
+                [[ "$include_target" =~ ^[Yy]$ ]] && to_remove+=("$target")
+            fi
+            for pkg in "${orphan_list_sorted[@]}"; do
+                to_remove+=("$pkg")
+            done
+            if [[ ${#to_remove[@]} -eq 0 ]]; then
+                info "No packages to remove."
+                return 0
+            fi
+            hr
+            info "Will remove: ${to_remove[*]}"
+            echo -e "${YELLOW}Proceed? (y/N): ${NC}"
+            read -r confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                for pkg in "${to_remove[@]}"; do
+                    run_privileged removepkg "$pkg"
+                done
+                info "Removal completed."
+            else
+                info "Removal cancelled."
+            fi
+            ;;
+        *)
+            info "Removal cancelled."
+            ;;
+    esac
+}
+
+inject_alternative_sources_placeholder() {
+    local slackbuild="$1"
+    local block_marker="MULTISBO ALTERNATIVE SOURCES"
+
+    if grep -q "$block_marker" "$slackbuild"; then
+        return 0
+    fi
+
+    local shebang_line
+    shebang_line=$(grep -m1 '^#!/' "$slackbuild" || true)
+
+    local rest_of_file
+    if [ -n "$shebang_line" ]; then
+        rest_of_file=$(grep -vF "$shebang_line" "$slackbuild")
+    else
+        rest_of_file=$(cat "$slackbuild")
+    fi
+
+    local temp_file=$(mktemp)
+
+    cat > "$temp_file" <<'EOF'
+# ----------------------------------------------------------------------
+# MULTISBO ALTERNATIVE SOURCES
+# ----------------------------------------------------------------------
+# If you want to use a different version or alternative source tarballs,
+# set ALTERNATIVE_SOURCES to semicolon-separated URLs, for example:
+#
+#   ALTERNATIVE_SOURCES="https://example.com/new-version.tar.gz;https://mirror.com/source.tar.bz2"
+#
+# IMPORTANT: If you provide alternative sources with a different version,
+#            you MUST change the VERSION variable above accordingly.
+#
+# The script will download these URLs instead of the original DOWNLOAD ones.
+# ----------------------------------------------------------------------
+ALTERNATIVE_SOURCES=""
+# ----------------------------------------------------------------------
+EOF
+
+    {
+        [ -n "$shebang_line" ] && printf '%s\n' "$shebang_line"
+        cat "$temp_file"
+        printf '%s\n' "$rest_of_file"
+    } > "$slackbuild"
+
+    rm -f "$temp_file"
+    info "Added alternative sources placeholder to $slackbuild"
+}
+
+get_expected_filenames() {
+    local info_file="$1"
+    local expected=()
+    source "$info_file" 2>/dev/null
+    for var in DOWNLOAD DOWNLOAD_x86_64 DOWNLOAD_arm; do
+        val="${!var}"
+        if [[ -n "$val" ]]; then
+            for url in $val; do
+                local fname=$(basename "$url" | sed 's/?.*//')
+                expected+=("$fname")
+            done
+        fi
+    done
+    printf '%s\n' "${expected[@]}"
 }
 
 direct_build() {
     local pkg="$1"
+    local force_reinstall="${2:-0}"
     local info_file=$(get_info_file "$pkg")
-    local pkg_dir=$(dirname "$info_file")
+    local pkg_dir
+    if [[ "$info_file" == "$ALIEN_INFO_DIR/"* ]]; then
+        pkg_dir="$ALIEN_DIR/$pkg/build"
+    else
+        pkg_dir=$(dirname "$info_file")
+    fi
 
     source "$info_file" 2>/dev/null
     if [[ -z "$PRGNAM" || -z "$VERSION" ]]; then
@@ -198,63 +1363,423 @@ direct_build() {
         return 1
     fi
 
-    info "Directly building $PRGNAM (version $VERSION) using SlackBuild..."
+    hr
+    info "Building $PRGNAM (version $VERSION) using SlackBuild..."
 
     cd "$pkg_dir" || return 1
+    find . -maxdepth 1 -type l -delete 2>/dev/null
 
-    local all_urls=()
-    for var in DOWNLOAD DOWNLOAD_x86_64 DOWNLOAD_arm; do
-        val="${!var}"
-        if [[ -n "$val" ]]; then
-            for url in $val; do
-                all_urls+=("$url")
-            done
-        fi
-    done
-
-    local missing=0
-    for url in "${all_urls[@]}"; do
-        local filename=$(basename "$url" | sed 's/?.*//')
-        if [[ ! -f "$filename" ]]; then
-            if [[ -f "/var/cache/sbopkg/$filename" ]]; then
-                ln -sf "/var/cache/sbopkg/$filename" "$filename"
-                info "Symlinked $filename from cache"
-            else
-                error "Missing source file: $filename"
-                missing=1
-            fi
-        fi
-    done
-
-    if [[ $missing -eq 1 ]]; then
-        error "Source files missing – cannot build directly"
-        return 1
+    if [[ "$info_file" == "$ALIEN_INFO_DIR/"* ]]; then
+        fetch_alien_build_files "$pkg"
     fi
 
-    if [ -f "./${PRGNAM}.SlackBuild" ]; then
-        info "Running ./${PRGNAM}.SlackBuild ..."
-        sudo bash "./${PRGNAM}.SlackBuild" 2>&1 | tee -a "$LOG_FILE"
-        if [ $? -ne 0 ]; then
-            error "SlackBuild failed for $PRGNAM"
-            return 1
-        fi
-    else
+    if [ ! -f "./${PRGNAM}.SlackBuild" ]; then
         error "No SlackBuild script found in $pkg_dir"
         return 1
     fi
 
-    local built_pkg=$(ls -t /tmp/${PRGNAM}-${VERSION}-*.t?z 2>/dev/null | head -1)
+    if [[ ! -f "${PRGNAM}.SlackBuild.multisbo.orig" ]]; then
+        cp "${PRGNAM}.SlackBuild" "${PRGNAM}.SlackBuild.multisbo.orig"
+        info "Created original backup: ${PRGNAM}.SlackBuild.multisbo.orig"
+    fi
+
+    apply_patches() {
+        local apply_cmake="$1"
+        local cmake_version="$2"
+        local native_marker="# MULTISBO_NATIVE_PATCHED"
+        local cmake_marker="# MULTISBO_CMAKE_PATCHED"
+
+        if [[ ! -f "${PRGNAM}.SlackBuild" ]]; then
+            cp "${PRGNAM}.SlackBuild.multisbo.orig" "${PRGNAM}.SlackBuild"
+            warn "Restored missing SlackBuild from .orig backup"
+        fi
+
+        if [[ $USE_NATIVE_FLAGS -eq 1 ]] && ! grep -q "$native_marker" "${PRGNAM}.SlackBuild" 2>/dev/null; then
+            info "Applying native CPU optimizations to SlackBuild (in‑place)..."
+            awk '
+            /^[[:space:]]*SLKCFLAGS=/ {
+                gsub(/ -march=[^ ]+/, "", $0)
+                gsub(/ -mtune=[^ ]+/, "", $0)
+                if (match($0, /-O2/)) {
+                    sub(/-O2/, "-O2 -march=native -mtune=native", $0)
+                } else {
+                    sub(/=/, "= -O2 -march=native -mtune=native ", $0)
+                }
+                gsub(/  /, " ", $0)
+                sub(/"$/, "", $0)
+                $0 = $0 "\""
+            }
+            { print }
+            ' "${PRGNAM}.SlackBuild" > "${PRGNAM}.SlackBuild.tmp"
+            mv "${PRGNAM}.SlackBuild.tmp" "${PRGNAM}.SlackBuild"
+            sed -i "2i $native_marker" "${PRGNAM}.SlackBuild"
+            info "✓ Native optimizations applied."
+        fi
+
+        if [[ $apply_cmake -eq 1 ]] && ! grep -q "$cmake_marker" "${PRGNAM}.SlackBuild" 2>/dev/null; then
+            if ! grep -q "CMAKE_POLICY_VERSION_MINIMUM" "${PRGNAM}.SlackBuild"; then
+                sed -i "2i export CMAKE_POLICY_VERSION_MINIMUM=${cmake_version}" "${PRGNAM}.SlackBuild"
+                sed -i "2i $cmake_marker" "${PRGNAM}.SlackBuild"
+                info "✓ Added CMake policy export (version ${cmake_version})."
+            fi
+        fi
+    }
+
+    local uses_cmake=0
+    if grep -q '^[[:space:]]*cmake' "${PRGNAM}.SlackBuild" 2>/dev/null; then
+        uses_cmake=1
+    fi
+
+    if [[ $USE_CMAKE_FIX -eq 1 ]]; then
+        apply_patches 1 "$CMAKE_POLICY_VERSION"
+    else
+        apply_patches 0
+    fi
+
+    local _interactive_done=""
+    if [[ $INTERACTIVE -eq 1 && -z "$_interactive_done" ]]; then
+        _interactive_done=1
+        hr
+        local readme_file="$pkg_dir/README"
+        if [[ ! -f "$readme_file" && -f "$pkg_dir/slack-desc" ]]; then
+            readme_file="$pkg_dir/slack-desc"
+        fi
+        if [[ -f "$readme_file" ]]; then
+            info "README for $PRGNAM:"
+            echo "-------------------------------------------------------"
+            cat "$readme_file"
+            echo "-------------------------------------------------------"
+            echo ""
+        else
+            warn "No README file found for $PRGNAM."
+        fi
+        while true; do
+            echo "Options:"
+            echo "  1) Continue (build the package)"
+            echo "  2) Edit SlackBuild (opens nano on ${PRGNAM}.SlackBuild)"
+            echo "  3) Skip this package"
+            echo "  4) Abort (exit multisbo)"
+            read -p "Your choice [1-4]: " choice
+            case "$choice" in
+                1) break ;;
+                2)
+                    if command -v nano &>/dev/null; then
+                        inject_alternative_sources_placeholder "${PRGNAM}.SlackBuild"
+                        nano "${PRGNAM}.SlackBuild"
+                        echo "Editor closed. Return to menu."
+                    else
+                        error "nano not found. Please install nano or choose another option."
+                    fi
+                    ;;
+                3)
+                    info "Skipping package $PRGNAM as requested."
+                    return 2
+                    ;;
+                4) info "Aborted by user."; cleanup 1 ;;
+                *) echo "Invalid choice. Please enter 1, 2, 3, or 4." ;;
+            esac
+        done
+    fi
+
+    local alt_sources=""
+    if [[ -f "${PRGNAM}.SlackBuild" ]]; then
+        alt_line=$(grep -E '^[[:space:]]*ALTERNATIVE_SOURCES=' "${PRGNAM}.SlackBuild" | head -1)
+        if [[ -n "$alt_line" ]]; then
+            alt_line=${alt_line#ALTERNATIVE_SOURCES=}
+            alt_line=${alt_line#[\"\']}
+            alt_line=${alt_line%[\"\']}
+            alt_sources="$alt_line"
+        fi
+    fi
+
+    local all_urls=()
+    if [[ -n "$alt_sources" ]]; then
+        info "Using ALTERNATIVE_SOURCES from edited SlackBuild."
+        IFS=';' read -ra alt_urls <<< "$alt_sources"
+        for url in "${alt_urls[@]}"; do
+            url=$(echo "$url" | xargs)
+            [[ -n "$url" ]] && all_urls+=("$url")
+        done
+        local orig_version="$VERSION"
+        local sb_version=$(grep -E '^[[:space:]]*VERSION=' "${PRGNAM}.SlackBuild" | head -1 | sed -E 's/.*VERSION=//; s/["'\'']//g')
+        if [[ -n "$orig_version" && "$sb_version" == "$orig_version" ]]; then
+            warn "ALTERNATIVE_SOURCES is set but VERSION is still '$orig_version'. If the tarball version differs, please update VERSION."
+        fi
+    else
+        for var in DOWNLOAD DOWNLOAD_x86_64 DOWNLOAD_arm; do
+            val="${!var}"
+            if [[ -n "$val" ]]; then
+                for url in $val; do
+                    all_urls+=("$url")
+                done
+            fi
+        done
+    fi
+
+
+    local missing=0
+    local any_success=0
+    local downloaded_files=()
+    for url in "${all_urls[@]}"; do
+        local filename=$(basename "$url" | sed 's/?.*//')
+        local cache_name="${PRGNAM}__${filename}"
+        if [[ ! -f "$filename" ]]; then
+            if [[ -f "$SOURCE_CACHE_DIR/$cache_name" ]]; then
+                ln -sf "$SOURCE_CACHE_DIR/$cache_name" "$filename"
+                info "Symlinked $filename from cache"
+                downloaded_files+=("$filename")
+                any_success=1
+            else
+                warn "Downloading $filename ..."
+                if wget --progress=bar:force -O "$SOURCE_CACHE_DIR/$cache_name" "$url"; then
+                    if [[ -s "$SOURCE_CACHE_DIR/$cache_name" ]]; then
+                        ln -sf "$SOURCE_CACHE_DIR/$cache_name" "$filename"
+                        info "Downloaded and symlinked $filename"
+                        downloaded_files+=("$filename")
+                        any_success=1
+                    else
+                        rm -f "$SOURCE_CACHE_DIR/$cache_name"
+                        error "Downloaded empty file for $filename"
+                        missing=1
+                    fi
+                else
+                    error "Failed to download $filename"
+                    missing=1
+                fi
+            fi
+        else
+            downloaded_files+=("$filename")
+            any_success=1
+        fi
+    done
+
+    if [[ $any_success -eq 1 ]]; then
+        declare -a expected_md5s=()
+        for var in MD5SUM MD5SUM_x86_64 MD5SUM_arm; do
+            val="${!var}"
+            if [[ -n "$val" ]]; then
+                for sum in $val; do
+                    expected_md5s+=("$sum")
+                done
+            fi
+        done
+
+        local md5_check_failed=0
+        for f in "${downloaded_files[@]}"; do
+            local actual_md5=$(md5sum "$f" | cut -d' ' -f1)
+            local found_match=0
+            for expected in "${expected_md5s[@]}"; do
+                if [[ "$actual_md5" == "$expected" ]]; then
+                    found_match=1
+                    break
+                fi
+            done
+            if [[ $found_match -eq 0 ]]; then
+                if [[ ${#expected_md5s[@]} -gt 0 ]]; then
+                    warn "MD5 checksum mismatch for $f."
+                    warn "  Expected any of: ${expected_md5s[*]}"
+                    warn "  Got: $actual_md5"
+                    read -p "Continue anyway? (y/N): " md5_choice
+                    if [[ ! "$md5_choice" =~ ^[Yy]$ ]]; then
+                        md5_check_failed=1
+                        break
+                    fi
+                else
+                    warn "No expected MD5SUM found in .info; cannot verify $f."
+                fi
+            else
+                info "MD5 checksum OK for $f"
+            fi
+        done
+
+        if [[ $md5_check_failed -eq 1 ]]; then
+            error "MD5 check failed for at least one source; aborting build."
+            return 1
+        fi
+    fi
+
+    if [[ $missing -eq 1 && $any_success -eq 0 ]]; then
+        error "All source downloads failed – cannot build"
+        return 1
+    fi
+
+    if [[ -n "$alt_sources" && $missing -eq 0 ]]; then
+        local detected_version=""
+        for f in "${downloaded_files[@]}"; do
+            if [[ "$f" =~ ([0-9]+\.[0-9]+(\.[0-9]+)?) ]]; then
+                detected_version="${BASH_REMATCH[1]}"
+                break
+            fi
+        done
+        [[ -z "$detected_version" ]] && detected_version="$VERSION"
+
+        while true; do
+            local current_version=""
+            local version_line=$(grep -E '^[[:space:]]*VERSION=' "${PRGNAM}.SlackBuild" | head -1)
+            if [[ -n "$version_line" ]]; then
+                current_version=$(echo "$version_line" | sed -E 's/^[[:space:]]*VERSION=//; s/^["'\'']//; s/["'\'']$//')
+                if [[ "$current_version" =~ ^\$\{VERSION:-([^}]*)\} ]]; then
+                    current_version="${BASH_REMATCH[1]}"
+                fi
+            fi
+            [[ -z "$current_version" ]] && current_version="$VERSION"
+
+            if [[ "$current_version" == "$detected_version" ]]; then
+                break
+            fi
+
+            warn "VERSION in SlackBuild ($current_version) does not match alternative source version ($detected_version)."
+            warn "The build will fail if versions differ."
+            echo ""
+            echo "Options:"
+            echo "  1) Edit SlackBuild (fix VERSION)"
+            echo "  2) Continue anyway (likely to fail)"
+            echo "  3) Abort"
+            read -p "Your choice [1-3]: " fix_choice
+
+            case "$fix_choice" in
+                1)
+                    if command -v nano &>/dev/null; then
+                        nano "${PRGNAM}.SlackBuild"
+                    else
+                        error "nano not found. Cannot edit. Aborting."
+                        return 1
+                    fi
+                    ;;
+                2)
+                    warn "Proceeding with version mismatch – build will likely fail."
+                    break
+                    ;;
+                3|*)
+                    info "Aborted by user."
+                    return 2
+                    ;;
+            esac
+        done
+
+        rm -f ${PRGNAM}-*.tar.* 2>/dev/null
+
+        local exts=()
+        if [[ -f "$info_file" ]]; then
+            for var in DOWNLOAD DOWNLOAD_x86_64 DOWNLOAD_arm; do
+                val=$(grep -E "^$var=" "$info_file" | head -1 | sed -E 's/.*=//; s/["'\'']//g')
+                for url in $val; do
+                    local fname=$(basename "$url" | sed 's/?.*//')
+                    local ext="${fname##*.}"
+                    [[ "$fname" == *.tar.* ]] && ext="tar.${fname##*.tar.}"
+                    exts+=("$ext")
+                done
+            done
+        fi
+        [[ ${#exts[@]} -eq 0 ]] && exts=("tar.xz")
+        local exts_uniq=($(printf '%s\n' "${exts[@]}" | sort -u))
+
+        local symlinked=0
+        for ext in "${exts_uniq[@]}"; do
+            local expected="${PRGNAM}-${detected_version}.${ext}"
+            if [[ ! -f "$expected" ]]; then
+                if [[ ${#downloaded_files[@]} -eq 1 ]]; then
+                    ln -sf "$SOURCE_CACHE_DIR/${PRGNAM}__${downloaded_files[0]}" "$expected"
+                    info "Created symlink: $expected -> ${downloaded_files[0]}"
+                    symlinked=1
+                elif [[ ${#downloaded_files[@]} -gt 1 ]]; then
+                    local matched=""
+                    for f in "${downloaded_files[@]}"; do
+                        if [[ "$f" == "$expected" || "$f" == *"${detected_version}"* ]]; then
+                            matched="$f"
+                            break
+                        fi
+                    done
+                    if [[ -n "$matched" ]]; then
+                        ln -sf "$SOURCE_CACHE_DIR/${PRGNAM}__${matched}" "$expected"
+                        info "Created symlink: $expected -> $matched"
+                        symlinked=1
+                    else
+                        warn "Expected file '$expected' not found and multiple alternative files exist."
+                        warn "Please manually create a symlink or rename the correct file."
+                    fi
+                fi
+            fi
+        done
+        [[ $symlinked -eq 1 ]] && info "Symlinked alternative source(s) to expected filename(s)."
+    fi
+
+    if [[ $missing -eq 1 && $any_success -eq 0 ]]; then
+        error "All source downloads failed – cannot build"
+        return 1
+    fi
+
+    info "Running ./${PRGNAM}.SlackBuild ..."
+    run_privileged bash "./${PRGNAM}.SlackBuild" 2>&1 | tee -a "$LOG_FILE"
+    build_exit=${PIPESTATUS[0]}
+
+    if [[ $build_exit -ne 0 ]] && [[ $uses_cmake -eq 1 ]] && [[ $USE_CMAKE_FIX -eq 0 ]]; then
+        local suggested_version=$(grep -oP 'CMAKE_POLICY_VERSION_MINIMUM=\K[0-9.]+' "$LOG_FILE" | tail -1)
+        if [[ -n "$suggested_version" ]]; then
+            warn "Build failed – retrying with CMake policy fix (version ${suggested_version})..."
+            if ! grep -q "CMAKE_POLICY_VERSION_MINIMUM" "${PRGNAM}.SlackBuild"; then
+                sed -i "2i export CMAKE_POLICY_VERSION_MINIMUM=${suggested_version}" "${PRGNAM}.SlackBuild"
+            fi
+            info "Running ./${PRGNAM}.SlackBuild (retry with cmake fix)..."
+            run_privileged bash "./${PRGNAM}.SlackBuild" 2>&1 | tee -a "$LOG_FILE"
+            build_exit=${PIPESTATUS[0]}
+        else
+            warn "Build failed, but no CMake policy version hint found – not retrying."
+        fi
+    fi
+
+    if [[ $build_exit -ne 0 ]]; then
+        error "SlackBuild failed for $PRGNAM"
+        return 1
+    fi
+
+    local built_pkg=$(ls -t /tmp/${PRGNAM}-${detected_version:-$VERSION}-*.t?z 2>/dev/null | head -1)
     if [[ -z "$built_pkg" ]]; then
         built_pkg=$(ls -t /tmp/${PRGNAM}-*.t?z 2>/dev/null | head -1)
     fi
+
     if [[ -f "$built_pkg" ]]; then
+        hr
         info "Installing $built_pkg ..."
-        if sudo installpkg "$built_pkg" 2>&1 | tee -a "$LOG_FILE"; then
-            info "Direct installation succeeded for $PRGNAM"
+        if check_installed "$PRGNAM"; then
+            if [[ $force_reinstall -eq 1 ]]; then
+                if [[ $CONFIRMED_UPDATE -eq 1 ]]; then
+                    hr
+                    info "Removing existing $PRGNAM package..."
+                    run_privileged removepkg "$(ls /var/log/packages/${PRGNAM}-* | head -1)" 2>&1 | tee -a "$LOG_FILE"
+                    hr
+                    info "Installing new $PRGNAM..."
+                    run_privileged installpkg "$built_pkg" 2>&1 | tee -a "$LOG_FILE"
+                else
+                    echo -e "${YELLOW}Package already installed. Force reinstall? (y/N): ${NC}"
+                    read -r force_confirm
+                    if [[ "$force_confirm" =~ ^[Yy]$ ]]; then
+                        hr
+                        info "Removing existing $PRGNAM package ..."
+                        run_privileged removepkg "$(ls /var/log/packages/${PRGNAM}-* | head -1)" 2>&1 | tee -a "$LOG_FILE"
+                        hr
+                        info "Installing new $PRGNAM ..."
+                        run_privileged installpkg "$built_pkg" 2>&1 | tee -a "$LOG_FILE"
+                    else
+                        warn "Skipping reinstall."
+                        return 1
+                    fi
+                fi
+            else
+                info "Package already installed – using upgradepkg --reinstall --install-new to replace."
+                run_privileged upgradepkg --reinstall --install-new "$built_pkg" 2>&1 | tee -a "$LOG_FILE"
+            fi
+        else
+            run_privileged installpkg "$built_pkg" 2>&1 | tee -a "$LOG_FILE"
+        fi
+
+        if [ $? -eq 0 ]; then
+            info "Installation succeeded for $PRGNAM"
             PROCESSED["$PRGNAM"]=1
+            INSTALLED["$PRGNAM"]=1
             return 0
         else
-            error "Direct installation command failed for $PRGNAM"
+            error "Installation command failed for $PRGNAM"
             return 1
         fi
     else
@@ -266,95 +1791,53 @@ direct_build() {
 install_package() {
     local pkg="$1"
     local parent="$2"
+    local force_reinstall="${3:-0}"
 
-    if check_installed "$pkg"; then
+    if [[ $force_reinstall -eq 0 ]] && check_installed "$pkg"; then
         info "$pkg already installed (skipping)."
+        SKIPPED["$pkg"]=1
         return 0
     fi
 
-    info "Installing $pkg (required by $parent)..."
-
-    local info_file=$(get_info_file "$pkg")
-    local urls=()
-    if [[ -f "$info_file" ]]; then
-        (
-            source "$info_file" 2>/dev/null
-            for var in $(set | grep -E '^DOWNLOAD[_a-zA-Z0-9]*=' | cut -d= -f1); do
-                val="${!var}"
-                for url in $val; do
-                    [[ -n "$url" ]] && echo "$url"
-                done
-            done
-        ) > /tmp/multisbo_urls.$$
-        if [[ -s /tmp/multisbo_urls.$$ ]]; then
-            mapfile -t urls < /tmp/multisbo_urls.$$
-            rm -f /tmp/multisbo_urls.$$
-            for url in "${urls[@]}"; do
-                local filename=$(basename "$url" | sed 's/?.*//')
-                if [[ ! -f "/var/cache/sbopkg/$filename" ]]; then
-                    info "Pre‑downloading missing source: $filename"
-                    sudo wget -q --show-progress -O "/var/cache/sbopkg/$filename" "$url" 2>&1 | tee -a "$LOG_FILE"
-                fi
-            done
-        fi
+    if [[ $force_reinstall -eq 1 ]] && check_installed "$pkg"; then
+        info "Reinstalling $pkg (forced update)."
+        unset "SKIPPED[$pkg]"
     fi
 
-    local cmd="sudo sbopkg -B -k -e continue -i $pkg"
-    [[ $INTERACTIVE -eq 1 ]] && cmd="sudo sbopkg -i $pkg"
-
-    log "Running: $cmd"
-    local tmp_out=$(mktemp)
-    eval "$cmd" 2>&1 | tee -a "$LOG_FILE" | tee "$tmp_out"
-    local sbopkg_exit=${PIPESTATUS[0]}
-
-    if [[ $sbopkg_exit -eq 0 ]] || ( [[ $sbopkg_exit -eq 1 ]] && check_installed "$pkg" ); then
-        local waited=0
-        local max_wait=5
-        while [[ $waited -lt $max_wait ]]; do
-            if check_installed "$pkg"; then
-                info "$pkg installed successfully via sbopkg."
-                rm -f "$tmp_out"
-                return 0
-            fi
-            sleep 1
-            ((waited++))
-        done
-        warn "sbopkg reported success but $pkg not in /var/log/packages/ after ${max_wait}s – assuming installed."
-        rm -f "$tmp_out"
+    if direct_build "$pkg" "$force_reinstall"; then
+        INSTALLED["$pkg"]=1
         return 0
-    fi
-
-    if [[ $INTERACTIVE -eq 0 ]]; then
-        warn "sbopkg failed (exit $sbopkg_exit) – attempting direct build for $pkg..."
-        if direct_build "$pkg"; then
-            info "$pkg installed successfully via direct build."
-            rm -f "$tmp_out"
-            return 0
-        else
-            error "Direct build also failed for $pkg"
+    else
+        local ret=$?
+        if [[ $ret -eq 2 ]]; then
+            info "Package $pkg skipped by user."
+            USER_SKIPPED["$pkg"]=1
+        return 0
+    else
+        error "Direct build failed for $pkg."
+        FAILED["$pkg"]="$parent"
+        return 1
         fi
     fi
-
-    error "Failed to install $pkg (required by $parent)"
-    rm -f "$tmp_out"
-    read -p "Continue with remaining packages? (y/n): " choice
-    if [[ "$choice" != "y" && "$choice" != "Y" ]]; then
-        error "Aborted by user."
-        cleanup 1
-    fi
-    FAILED["$pkg"]="$parent"
-    return 1
 }
 
-# Recursive resolver
 declare -A PROCESSED
 declare -A FAILED
 declare -A VISITING
+declare -A INSTALLED
+declare -A SKIPPED
+declare -A USER_SKIPPED 
+declare -A UPDATE_NEEDED
+declare -a TO_UPDATE_LIST
+declare -A TO_UPDATE_FLAG
+declare -a RESOLVE_ORDER
 
 resolve() {
     local pkg="$1"
     local parent="$2"
     local depth="$3"
+    local check_only="${4:-0}"
+    local update_mode="${5:-0}"
 
     if [[ -n "${PROCESSED[$pkg]}" ]]; then
         return
@@ -367,11 +1850,10 @@ resolve() {
     fi
     VISITING["$pkg"]=1
 
+    local already_installed=0
     if check_installed "$pkg"; then
         info "$pkg already installed."
-        PROCESSED["$pkg"]=1
-        unset VISITING["$pkg"]
-        return
+        already_installed=1
     fi
 
     local info_file=$(get_info_file "$pkg")
@@ -390,27 +1872,132 @@ resolve() {
 
     local deps=($(parse_requires "$info_file"))
     for dep in "${deps[@]}"; do
-        resolve "$dep" "$pkg" "$((depth+1))"
+        resolve "$dep" "$pkg" "$((depth+1))" "$check_only" "$update_mode"
     done
 
-    if ! check_installed "$pkg"; then
-        install_package "$pkg" "$parent"
+    if [[ $check_only -eq 1 ]]; then
+        local current_ver=$(get_current_version "$pkg")
+        local available_ver=$(get_available_version "$pkg")
+        if [[ -n "$current_ver" ]] && [[ -n "$available_ver" ]]; then
+            if compare_versions "$current_ver" "$available_ver"; then
+                UPDATE_NEEDED["$pkg"]="$current_ver -> $available_ver"
+                info "Update available for $pkg: $current_ver -> $available_ver"
+            fi
+        fi
+    elif [[ $update_mode -eq 1 ]]; then
+        local current_ver=$(get_current_version "$pkg")
+        local available_ver=$(get_available_version "$pkg")
+        local need_reinstall=0
+
+        if [[ $already_installed -eq 0 ]]; then
+            need_reinstall=1
+            info "New package: $pkg (will be installed)."
+        elif [[ -n "$current_ver" ]] && [[ -n "$available_ver" ]]; then
+            if compare_versions "$current_ver" "$available_ver"; then
+                need_reinstall=1
+                UPDATE_NEEDED["$pkg"]="$current_ver -> $available_ver"
+                info "Update available for $pkg: $current_ver -> $available_ver"
+            else
+                info "$pkg already up to date (version $current_ver)."
+                SKIPPED["$pkg"]=1
+            fi
+        else
+            info "$pkg version unknown – skipping."
+            SKIPPED["$pkg"]=1
+        fi
+
+        if [[ $need_reinstall -eq 1 ]]; then
+            if [[ -z "${TO_UPDATE_FLAG[$pkg]}" ]]; then
+                TO_UPDATE_LIST+=("$pkg")
+                TO_UPDATE_FLAG[$pkg]=1
+            fi
+        fi
+    else
+        if [[ $already_installed -eq 0 ]]; then
+            if ! install_package "$pkg" "$parent" 0; then
+                prompt_on_fail "$pkg" "$parent"
+                FAILED["$pkg"]="$parent"
+                PROCESSED["$pkg"]=1
+                RESOLVE_ORDER+=("$pkg")
+                unset VISITING["$pkg"]
+                return
+            fi
+        else
+            SKIPPED["$pkg"]=1
+        fi
     fi
+
     PROCESSED["$pkg"]=1
+    RESOLVE_ORDER+=("$pkg")
     unset VISITING["$pkg"]
 }
 
 print_summary() {
     echo ""
+    if [[ $CHECK_UPDATES -eq 1 ]]; then
+        hr
+        info "=== Package status ==="
+        local sorted_pkgs=($(echo "${!PROCESSED[@]}" | tr ' ' '\n' | sort))
+        local updates_found=0
+        for pkg in "${sorted_pkgs[@]}"; do
+            local current=$(get_current_version "$pkg")
+            local available=$(get_available_version "$pkg")
+            if [[ -z "$current" && -z "$available" ]]; then
+                warn "  $pkg : unknown (not installed, but .info missing?)"
+            elif [[ -z "$current" ]]; then
+                echo "  $pkg : not installed (available: $available)"
+            elif [[ -z "$available" ]]; then
+                echo "  $pkg : installed ($current) – no .info found"
+            else
+                if compare_versions "$current" "$available"; then
+                    echo -e "${YELLOW}  $pkg : $current -> $available (update available)${NC}"
+                    updates_found=1
+                else
+                    echo "  $pkg : $current (up to date)"
+                fi
+            fi
+        done
+        if [[ $updates_found -eq 0 ]]; then
+            info "No updates available."
+        fi
+        echo ""
+        info "Full log written to: $LOG_FILE"
+        return
+    fi
+
+    if [[ ${#INSTALLED[@]} -gt 0 ]]; then
+        hr
+        info "=== Successfully installed packages ==="
+        for pkg in $(echo "${!INSTALLED[@]}" | tr ' ' '\n' | sort); do
+            echo "  $pkg"
+        done
+    fi
+    if [[ ${#USER_SKIPPED[@]} -gt 0 ]]; then
+        hr
+        info "=== Explicitly skipped by user ==="
+        for pkg in $(echo "${!USER_SKIPPED[@]}" | tr ' ' '\n' | sort); do
+            echo "  $pkg"
+        done
+    fi
+    if [[ ${#SKIPPED[@]} -gt 0 ]]; then
+        hr
+        info "=== Already installed (skipped) ==="
+        for pkg in $(echo "${!SKIPPED[@]}" | tr ' ' '\n' | sort); do
+            echo "  $pkg"
+        done
+    fi
     if [[ ${#FAILED[@]} -gt 0 ]]; then
-        error "=== Summary of failures ==="
-        for pkg in "${!FAILED[@]}"; do
+        hr
+        error "=== Failed packages ==="
+        for pkg in $(echo "${!FAILED[@]}" | tr ' ' '\n' | sort); do
             local parent="${FAILED[$pkg]}"
             echo "  $pkg (required by $parent)"
         done
         log "Failures: ${!FAILED[@]}"
-    else
-        info "All packages installed successfully."
+    fi
+    if [[ ${#INSTALLED[@]} -eq 0 && ${#SKIPPED[@]} -eq 0 && ${#FAILED[@]} -eq 0 ]]; then
+        hr
+        warn "No packages were processed."
     fi
     echo ""
     info "Full log written to: $LOG_FILE"
@@ -421,25 +2008,150 @@ usage() {
 Usage: $SCRIPT_NAME [OPTIONS] <package_name>
 
 Options:
-  --interactive      Do NOT use sbopkg -B -k -e continue; let sbopkg ask prompts manually
-  -h, --help         Show this help
+  -dn, --disable-native            Disable native CPU optimization
+  -ecf, --enable-cmake-fix[=VER]   Enable CMake policy fix (default 3.5)
+  -c, --check-updates              Check for available updates (no build)
+  -u, --update                     Update the package and its dependencies
+  -i, --interactive                Interactive mode: show README, allow SlackBuild editing before each build
+  -a, --alien                      Prefer AlienBob's SlackBuilds over SBo when both exist
+  -fs, --force-single              Ignore dependencies, build only the specified package
+  -s, --sync-sbo[=branch]          Clone/update the SlackBuilds repo
+  --sync-alien                     Mirror AlienBob's SlackBuilds tree
+  -d, --dependents <pkg>           Show installed packages that depend on <pkg> (ELF runtime)
+  -r, --remove <pkg>               Analyse and optionally remove a package and its dependencies
+  -h, --help                       Show this help
 
-Example:
-  $SCRIPT_NAME letsencrypt
-  $SCRIPT_NAME --interactive letsencrypt
+This script uses a local clone of the SlackBuilds repository
+(under $SBO_REPO_DIR), an optional AlienBob mirror (under $ALIEN_DIR),
+and caches sources in $SOURCE_CACHE_DIR.
+The SBo repo is auto‑cloned on first use.
+
+Examples:
+  $SCRIPT_NAME letsencrypt         # auto‑clones SBo, builds with native optimisations
+  $SCRIPT_NAME -s                  # sync SBo only
+  $SCRIPT_NAME --sync-alien        # sync AlienBob only
+  $SCRIPT_NAME -s --sync-alien     # sync both
+  $SCRIPT_NAME -a -i ffmpeg        # prefer AlienBob, interactive
+  $SCRIPT_NAME -dn -ecf=3.6 foo    # no native, cmake fix 3.6
+  $SCRIPT_NAME -c foo              # check updates for foo and deps
+  $SCRIPT_NAME -u foo              # update foo and deps
+  $SCRIPT_NAME -i foo              # interactive build, README+edit for each package
+  $SCRIPT_NAME -d libpng           # which packages depend on libpng?
+  $SCRIPT_NAME -fs bar             # install 'bar' ignoring all dependencies
 EOF
 }
 
 main() {
+    if ! cd . 2>/dev/null; then
+        warn "Current directory does not exist or is inaccessible. Changing to /tmp."
+        cd /tmp || { error "Cannot change to /tmp"; exit 1; }
+    fi
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --interactive)   INTERACTIVE=1; shift ;;
-            -h|--help)       usage; exit 0 ;;
-            --)              shift; break ;;
-            -*)              error "Unknown option: $1"; usage; exit 1 ;;
-            *)               break ;;
+            -dn|--disable-native)   USE_NATIVE_FLAGS=0; shift ;;
+            -ecf|--enable-cmake-fix)
+                USE_CMAKE_FIX=1
+                if [[ "$2" =~ ^[0-9]+\.[0-9]+$ ]]; then
+                    CMAKE_POLICY_VERSION="$2"
+                    shift 2
+                else
+                    CMAKE_POLICY_VERSION="3.5"
+                    shift
+                fi
+                ;;
+            -ecf=*|--enable-cmake-fix=*)
+                USE_CMAKE_FIX=1
+                CMAKE_POLICY_VERSION="${1#*=}"
+                shift
+                ;;
+            -c|--check-updates)     CHECK_UPDATES=1; shift ;;
+            -u|--update)            UPDATE_MODE=1; shift ;;
+            -i|--interactive)       INTERACTIVE=1; shift ;;
+            -fs|--force-single)     FORCE_SINGLE=1; shift ;;
+            -a|--alien)             PREFER_ALIEN=1; shift ;;
+            -s|--sync-sbo)
+                SYNC_SBO=1
+                if [[ "$2" =~ ^[0-9]+\.[0-9]+$ ]]; then
+                    SYNC_SBO_BRANCH="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            --sync-sbo=*)
+                SYNC_SBO=1
+                SYNC_SBO_BRANCH="${1#*=}"
+                shift
+                ;;
+            --sync-alien)           SYNC_ALIEN=1; shift ;;
+            -d|--dependents)        REVERSE_DEPS=1; shift ;;
+            -r|--remove)            REMOVE_MODE=1; shift ;;
+            -h|--help)              usage; exit 0 ;;
+            --)                     shift; break ;;
+            -*)                     error "Unknown option: $1"; usage; exit 1 ;;
+            *)                      break ;;
         esac
     done
+
+    SBO_VERSION=$(get_slackware_version)
+
+    if [[ $REVERSE_DEPS -eq 1 ]]; then
+        if [[ $# -ne 1 ]]; then
+            error "Missing package name for -d/--dependents."
+            usage
+            exit 1
+        fi
+        local query_pkg="$1"
+        check_dependencies
+        check_sudo
+
+        if [[ ! -d "$SBO_REPO_DIR" ]] || \
+           [[ -z "$(find "$SBO_REPO_DIR" -type f -name '*.info' -not -path '*/.git/*' -print -quit 2>/dev/null)" ]]; then
+            clone_or_update_sbo "${SYNC_SBO_BRANCH:-$(get_slackware_version)}"
+        fi
+
+        load_elf_cache
+        load_persistent_cache
+        show_dependency_report "$query_pkg"
+        exit 0
+    fi
+
+    if [[ $REMOVE_MODE -eq 1 ]]; then
+        if [[ $# -ne 1 ]]; then
+            error "Missing package name for -r/--remove."
+            usage
+            exit 1
+        fi
+        local remove_target="$1"
+        check_dependencies
+        check_sudo
+        do_removal "$remove_target"
+        exit 0
+    fi
+
+    if [[ $SYNC_SBO -eq 1 || $SYNC_ALIEN -eq 1 ]]; then
+        if [[ $SYNC_SBO -eq 1 ]]; then
+            clone_or_update_sbo "${SYNC_SBO_BRANCH:-$(get_slackware_version)}"
+        fi
+        if [[ $SYNC_ALIEN -eq 1 ]]; then
+            sync_alien
+        fi
+        if [[ $# -eq 0 ]]; then
+            info "Sync operations completed."
+            exit 0
+        fi
+    fi
+
+    if [[ $CHECK_UPDATES -eq 1 && $UPDATE_MODE -eq 1 ]]; then
+        error "Cannot use --check-updates and --update together."
+        usage
+        exit 1
+    fi
+
+    if [[ $INTERACTIVE -eq 1 && $CHECK_UPDATES -eq 1 ]]; then
+        error "Interactive mode cannot be used with --check-updates."
+        exit 1
+    fi
 
     if [[ $# -ne 1 ]]; then
         error "Missing package name."
@@ -450,28 +2162,325 @@ main() {
 
     check_dependencies
     check_sudo
-    check_sbopkg_lock
 
     SBO_VERSION=$(get_slackware_version)
-    info "Using SBo version: $SBO_VERSION"
+    hr
+    info "Using Slackware version: $SBO_VERSION"
+
+    if [[ ! -d "$SBO_REPO_DIR" ]]; then
+        info "Local SlackBuilds repository not found – auto-cloning into $SBO_REPO_DIR"
+        clone_or_update_sbo "${SYNC_SBO_BRANCH:-$SBO_VERSION}"
+    fi
+
+    if [[ $USE_NATIVE_FLAGS -eq 1 ]]; then
+        info "Native CPU optimisation: ENABLED"
+    else
+        info "Native CPU optimisation: DISABLED"
+    fi
+
+    if [[ $USE_CMAKE_FIX -eq 1 ]]; then
+        info "CMake policy fix: ENABLED (version ${CMAKE_POLICY_VERSION})"
+    else
+        info "CMake policy fix: DISABLED"
+    fi
 
     if [[ $INTERACTIVE -eq 1 ]]; then
-        info "Running in INTERACTIVE mode (sbopkg will ask all prompts)"
-    else
-        info "Running in AUTO mode with pre‑download and direct build fallback"
+        info "Interactive mode: ENABLED (README + editing before each build)"
+    fi
+
+    if [[ $PREFER_ALIEN -eq 1 ]]; then
+        info "AlienBob repository: preferred over SBo when both exist"
+    fi
+
+    if [[ $CHECK_UPDATES -eq 1 ]]; then
+        info "Checking for updates (no builds will be performed)."
+    elif [[ $UPDATE_MODE -eq 1 ]]; then
+        info "Update mode enabled – will rebuild outdated packages."
     fi
 
     load_persistent_cache
 
+    if [[ -z "${INFO_CACHE[$target_pkg]}" && ! -d "$ALIEN_DIR" && $ALIEN_SYNC_OFFERED -eq 0 ]]; then
+        ALIEN_SYNC_OFFERED=1
+        warn "Package '$target_pkg' not found in SBo, and AlienBob mirror is not present."
+        read -p "Would you like to sync the AlienBob SlackBuilds mirror now? (y/N): " do_sync
+        if [[ "$do_sync" =~ ^[Yy]$ ]]; then
+            sync_alien
+            info "Cache rebuilt with AlienBob packages."
+        fi
+    fi
+
     if [[ -z "$(get_info_file "$target_pkg")" ]]; then
-        error "Package $target_pkg not found in SBo $SBO_VERSION"
+        error "Package $target_pkg not found in local SBo repository nor in AlienBob mirror."
         cleanup 1
     fi
 
-    echo "===== multisbo run started at $(date) =====" > "$LOG_FILE"
-    log "Target: $target_pkg, Interactive: $INTERACTIVE, SBo version: $SBO_VERSION"
+    if [[ $FORCE_SINGLE -eq 1 ]]; then
+        info "Force single mode: ignoring all dependencies for $target_pkg"
 
-    resolve "$target_pkg" "command line" 0
+        if [[ $CHECK_UPDATES -eq 1 ]]; then
+            local current=$(get_current_version "$target_pkg")
+            local available=$(get_available_version "$target_pkg")
+            hr
+            if [[ -z "$current" ]]; then
+                info "Package $target_pkg is not installed (available: $available)"
+            elif [[ -n "$available" ]] && compare_versions "$current" "$available"; then
+                echo -e "${YELLOW}Update available: $target_pkg $current -> $available${NC}"
+            else
+                echo "$target_pkg is up to date ($current)"
+            fi
+            print_summary
+            cleanup 0
+
+        elif [[ $UPDATE_MODE -eq 1 ]]; then
+            if check_installed "$target_pkg"; then
+                local current=$(get_current_version "$target_pkg")
+                local available=$(get_available_version "$target_pkg")
+                if [[ -n "$available" ]] && compare_versions "$current" "$available"; then
+                    info "Updating $target_pkg: $current -> $available"
+                    install_package "$target_pkg" "command line" 1
+                else
+                    info "$target_pkg is already up to date ($current)"
+                fi
+            else
+                info "Installing $target_pkg (not currently installed)"
+                install_package "$target_pkg" "command line" 0
+            fi
+            print_summary
+            cleanup 0
+
+        else
+            install_package "$target_pkg" "command line" 0
+            print_summary
+            cleanup 0
+        fi
+    fi
+
+    echo "===== multisbo run started at $(date) =====" > "$LOG_FILE"
+    log "Target: $target_pkg, Native: $USE_NATIVE_FLAGS, CMakeFix: $USE_CMAKE_FIX:$CMAKE_POLICY_VERSION, CheckUpdates: $CHECK_UPDATES, Update: $UPDATE_MODE, Interactive: $INTERACTIVE, PreferAlien: $PREFER_ALIEN, SBo version: $SBO_VERSION"
+
+    resolve "$target_pkg" "command line" 0 "$CHECK_UPDATES" "$UPDATE_MODE"
+
+    if [[ $UPDATE_MODE -eq 1 ]]; then
+        if [[ ${#TO_UPDATE_LIST[@]} -gt 0 ]]; then
+            echo ""
+            hr
+            info "The following packages will be updated:"
+            for pkg in "${TO_UPDATE_LIST[@]}"; do
+                if [[ -n "${UPDATE_NEEDED[$pkg]}" ]]; then
+                    echo "  $pkg : ${UPDATE_NEEDED[$pkg]}"
+                else
+                    echo "  $pkg (new install)"
+                fi
+            done
+            echo ""
+            echo "Proceed with updating these packages?"
+            echo "  1) Yes, all – build and install everything"
+            echo "  2) Interactive – ask for each package"
+            echo "  3) No – cancel"
+            read -p "Your choice [1-3]: " confirm
+
+            case "$confirm" in
+                1)
+                    CONFIRMED_UPDATE=1
+                    hr
+                    info "Updating all packages..."
+                    for pkg in "${TO_UPDATE_LIST[@]}"; do
+                        if ! install_package "$pkg" "command line" 1; then
+                            prompt_on_fail "$pkg" "command line"
+                        fi
+                    done
+                    ;;
+                2)
+                    hr
+                    info "Updating packages interactively... (4 = quit at any time)"
+                    for pkg in "${TO_UPDATE_LIST[@]}"; do
+                        local info_file=$(get_info_file "$pkg")
+                        if [[ -n "$info_file" ]]; then
+                            local pkg_dir
+                            if [[ "$info_file" == "$ALIEN_INFO_DIR/"* ]]; then
+                                pkg_dir="$ALIEN_DIR/$pkg/build"
+                            else
+                                pkg_dir=$(dirname "$info_file")
+                            fi
+                            local readme_file="$pkg_dir/README"
+                            [[ ! -f "$readme_file" ]] && readme_file="$pkg_dir/slack-desc"
+                            if [[ -f "$readme_file" ]]; then
+                                echo ""
+                                hr
+                                info "README for $pkg:"
+                                echo "-------------------------------------------------------"
+                                cat "$readme_file"
+                                echo "-------------------------------------------------------"
+                                echo ""
+                            fi
+                        fi
+
+                        while true; do
+                        echo ""
+                        if [[ -n "${UPDATE_NEEDED[$pkg]}" ]]; then
+                            echo -e "${YELLOW}Update $pkg (${UPDATE_NEEDED[$pkg]})${NC}"
+                        else
+                            echo -e "${YELLOW}Install new package $pkg${NC}"
+                        fi
+                        echo "  1) Build / update this package"
+                            echo "  2) Edit SlackBuild (opens nano)"
+                            echo "  3) Skip this package"
+                            echo "  4) Quit (stop update process)"
+                            read -p "Your choice [1-4]: " pkg_confirm
+
+                        case "$pkg_confirm" in
+                                4) info "Update process stopped by user."; break 2 ;;
+                                3) info "Skipping $pkg."; break ;;
+                                2)
+                                    local slackbuild_path=""
+                                    if [[ -n "$info_file" && -f "$info_file" ]]; then
+                                        if [[ "$info_file" == "$ALIEN_INFO_DIR/"* ]]; then
+                                            slackbuild_path="$ALIEN_DIR/$pkg/build/${pkg}.SlackBuild"
+                                        else
+                                            slackbuild_path="$(dirname "$info_file")/${pkg}.SlackBuild"
+                                        fi
+                                    fi
+                                    if [[ -f "$slackbuild_path" ]]; then
+                                        if command -v nano &>/dev/null; then
+                                            inject_alternative_sources_placeholder "$slackbuild_path"
+                                            nano "$slackbuild_path"
+                                            echo "Editor closed. Return to menu."
+                                        else
+                                            error "nano not found. Please install nano."
+                                        fi
+                                    else
+                                        error "SlackBuild not found for $pkg at $slackbuild_path"
+                                    fi
+                                    ;;
+                            1)
+                                CONFIRMED_UPDATE=1
+                                if ! install_package "$pkg" "command line" 1; then
+                                    warn "Build/install failed for $pkg."
+                                    read -p "Continue with next package? (Y/n): " cont
+                                    if [[ "$cont" =~ ^[Nn]$ ]]; then
+                                        print_early_summary
+                                        cleanup 1
+                                    fi
+                                fi
+                                    break
+                                ;;
+                                *) echo "Invalid choice. Please enter 1–4." ;;
+                        esac
+                        done
+                    done
+                    ;;
+                *)
+                    info "Update cancelled by user."
+                    ;;
+            esac
+        else
+            echo ""
+            hr
+            info "All packages are up to date."
+            echo "Force reinstall packages in the dependency tree?"
+            echo "  1) Yes – force reinstall ALL"
+            echo "  2) Choose which packages to force reinstall"
+            echo "  3) No – cancel"
+            read -p "Your choice [1-3]: " force_choice
+
+            case "$force_choice" in
+                1)
+                    CONFIRMED_UPDATE=1
+                    hr
+                    info "Force reinstalling all packages in correct dependency order..."
+                    for pkg in "${RESOLVE_ORDER[@]}"; do
+                        if check_installed "$pkg"; then
+                            unset SKIPPED["$pkg"]
+                            install_package "$pkg" "command line" 1
+                        fi
+                    done
+                    ;;
+                2)
+                    hr
+                    info "Updating packages interactively... (4 = quit at any time)"
+                    for pkg in "${TO_UPDATE_LIST[@]}"; do
+                        local info_file=$(get_info_file "$pkg")
+                        if [[ -n "$info_file" ]]; then
+                            local pkg_dir
+                            if [[ "$info_file" == "$ALIEN_INFO_DIR/"* ]]; then
+                                pkg_dir="$ALIEN_DIR/$pkg/build"
+                            else
+                                pkg_dir=$(dirname "$info_file")
+                            fi
+                            local readme_file="$pkg_dir/README"
+                            [[ ! -f "$readme_file" ]] && readme_file="$pkg_dir/slack-desc"
+                            if [[ -f "$readme_file" ]]; then
+                                echo ""
+                                hr
+                                info "README for $pkg:"
+                                echo "-------------------------------------------------------"
+                                cat "$readme_file"
+                                echo "-------------------------------------------------------"
+                                echo ""
+                            fi
+                        fi
+
+                        while true; do
+                        echo ""
+                            if [[ -n "${UPDATE_NEEDED[$pkg]}" ]]; then
+                                echo -e "${YELLOW}Update $pkg (${UPDATE_NEEDED[$pkg]})${NC}"
+                            else
+                                echo -e "${YELLOW}Install new package $pkg${NC}"
+                            fi
+                            echo "  1) Build / update this package"
+                            echo "  2) Edit SlackBuild (opens nano)"
+                            echo "  3) Skip this package"
+                            echo "  4) Quit (stop update process)"
+                            read -p "Your choice [1-4]: " pkg_confirm
+
+                            case "$pkg_confirm" in
+                                4) info "Update process stopped by user."; break 2 ;;
+                                3) info "Skipping $pkg."; break ;;
+                                2)
+                                    local slackbuild_path=""
+                                    if [[ -n "$info_file" && -f "$info_file" ]]; then
+                                        if [[ "$info_file" == "$ALIEN_INFO_DIR/"* ]]; then
+                                            slackbuild_path="$ALIEN_DIR/$pkg/build/${pkg}.SlackBuild"
+                                        else
+                                            slackbuild_path="$(dirname "$info_file")/${pkg}.SlackBuild"
+                                        fi
+                                    fi
+                                    if [[ -f "$slackbuild_path" ]]; then
+                                        if command -v nano &>/dev/null; then
+                                            inject_alternative_sources_placeholder "$slackbuild_path"
+                                            nano "$slackbuild_path"
+                                            echo "Editor closed. Return to menu."
+                                        else
+                                            error "nano not found. Please install nano."
+                                        fi
+                                    else
+                                        error "SlackBuild not found for $pkg at $slackbuild_path"
+                                    fi
+                                    ;;
+                                1)
+                                    CONFIRMED_UPDATE=1
+                                if ! install_package "$pkg" "command line" 1; then
+                                    warn "Build/install failed for $pkg."
+                                    read -p "Continue with next package? (Y/n): " cont
+                                    if [[ "$cont" =~ ^[Nn]$ ]]; then
+                                        print_early_summary
+                                        cleanup 1
+                                    fi
+                                fi
+                                    break
+                                ;;
+                                *) echo "Invalid choice. Please enter 1–4." ;;
+                        esac
+                        done
+                    done
+                    ;;
+                *)
+                    info "Force reinstall cancelled by user."
+                    ;;
+            esac
+        fi
+    fi
 
     print_summary
     if [[ ${#FAILED[@]} -gt 0 ]]; then
@@ -482,5 +2491,4 @@ main() {
 }
 
 trap 'cleanup 1' INT TERM
-
 main "$@"
