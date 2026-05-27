@@ -1,4 +1,4 @@
-# Slackware multisbo – Recursive dependency resolver and source builder for SlackBuilds
+# Slackware multisbo – recursive dependency resolver and source builder for SlackBuilds
 
 `multisbo` is a Bash script that resolves and builds SlackBuild packages from **SlackBuilds.org** and **AlienBob** repositories, including recursive `REQUIRES` dependencies. It maintains its own local clones of the upstream repositories, caches `.info` files and source tarballs, and provides optional ELF‑level reverse dependency analysis for installed packages.
 
