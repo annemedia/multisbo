@@ -86,12 +86,12 @@ multisbo -i <pkg>
 multisbo <pkg>
 ```
 
-**Sync only the SBo repository** (no build):
+**Sync the SBo repository** (useful before running updates):
 ```bash
 multisbo -s
 ```
 
-**Sync AlienBob** (useful before first install that might need Alien):
+**Sync AlienBob** (useful before running updates):
 ```bash
 multisbo --sync-alien
 ```
