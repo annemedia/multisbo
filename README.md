@@ -69,7 +69,7 @@ multisbo [OPTIONS] <package_name>
 
 - If the local SBo repository does not exist, `multisbo` clones it automatically (shallow clone, default branch = `$SLACKWARE_VERSION`).  
 - The AlienBob mirror is not synced automatically. Use --sync-alien to sync explicitly. However, if a package is missing from SBo and the mirror is absent, the script will offer to sync it (requires confirmation).
-- The ELF dependency cache is built incrementally. A full scan occurs only when the set of installed packages changes or when timestamps indicate modifications.
+- The ELF dependency cache is built incrementally. Full scan happens on first -d or -r request, an incremental scan occurs only when the set of installed packages changes or when timestamps indicate modifications.
 - `-r` operates **only on runtime ELF dependencies**. Build‑time (`REQUIRES`) dependencies are not considered candidates for removal.
 - `-c` and `-u` compare package versions by parsing the `VERSION` and `BUILD` fields from the `.info` file. The version comparison uses whatever SBo/Alien metadata is already present locally. For accurate results, run -s (and --sync-alien if needed) before -c or -u.
 - When `-u` finds outdated packages, the script lists them and prompts with options to update all, update interactively (per‑package), or cancel. Interactive per‑package mode allows building, editing the SlackBuild, skipping, or quitting.
