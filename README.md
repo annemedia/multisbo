@@ -106,7 +106,7 @@ multisbo -a -ecf=3.10 -dn <pkg>
 multisbo -c <pkg>
 ```
 
-**Upgrade and all outdated dependencies** (non‑interactive):
+**Upgrade and all outdated dependencies** (interactive):
 ```bash
 multisbo -u <pkg>
 ```
