@@ -26,7 +26,7 @@
 - `sudo` (for `installpkg`, `upgradepkg`, `removepkg`)
 - `git` (to clone the SBo repository)
 - `rsync` (optional; required only for `--sync-alien`)
-- Standard POSIX tools: `bash`, bc, `grep`, `sed`, `tr`, `find`, `ls`, `wget`, `file`, `readelf`, `md5sum`, `installpkg`, `upgradepkg`, `removepkg`
+- Standard POSIX tools: `bash`, `bc`, `grep`, `sed`, `tr`, `find`, `ls`, `wget`, `file`, `readelf`, `md5sum`, `installpkg`, `upgradepkg`, `removepkg`
 
 ## Installation
 
